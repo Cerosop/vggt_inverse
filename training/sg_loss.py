@@ -1,0 +1,494 @@
+# SG (Spherical Gaussian) Loss Functions for VGGT.
+#
+# Includes:
+# - Hungarian Matching Loss: optimal assignment between predicted and GT SG lobes
+# - Repulsion Loss: prevents lobes from collapsing to the same direction
+# - BRDF Render Loss: MSE between rendered and input images
+
+import logging
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict
+from scipy.optimize import linear_sum_assignment
+
+
+logger = logging.getLogger(__name__)
+
+
+class SGLoss(nn.Module):
+    """Loss functions for Spherical Gaussian lighting estimation.
+
+    Args:
+        weight_brdf_render: Weight for BRDF render loss.
+        weight_repulsion: Weight for lobe repulsion loss.
+        repulsion_threshold: Cosine similarity threshold for repulsion.
+        weight_hungarian: Weight for Hungarian matching loss (when GT SG available).
+        enable_hungarian: Whether to enable Hungarian matching loss.
+        render_downsample: Downsample factor for BRDF rendering (VRAM saving).
+    """
+
+    def __init__(
+        self,
+        weight_brdf_render: float = 1.0,
+        weight_repulsion: float = 0.01,
+        repulsion_threshold: float = 0.9,
+        weight_hungarian: float = 1.0,
+        enable_hungarian: bool = False,
+        render_downsample: int = 2,
+        sg_phase1_end: float = 0.2,
+        sg_phase2_end: float = 0.4,
+        weight_sg_l2: float = 1.0,
+        enable_sg_l2: bool = True,
+        enable_env_map_log_l2: bool = True,
+        weight_env_map_log_l2: float = 1.0,
+        enable_diffuse_constraint: bool = False,
+        weight_diffuse_constraint: float = 0.5,
+    ):
+        super().__init__()
+        self.weight_brdf_render = weight_brdf_render
+        self.weight_repulsion = weight_repulsion
+        self.repulsion_threshold = repulsion_threshold
+        # Hungarian is subsumed by L2 phase GT loss logic
+        self.enable_hungarian = enable_hungarian
+        self.weight_hungarian = weight_hungarian
+        self.render_downsample = render_downsample
+        self.sg_phase1_end = sg_phase1_end
+        self.sg_phase2_end = sg_phase2_end
+        self.enable_sg_l2 = enable_sg_l2
+        self.weight_sg_l2 = weight_sg_l2
+        self.enable_env_map_log_l2 = enable_env_map_log_l2
+        self.weight_env_map_log_l2 = weight_env_map_log_l2
+        self.enable_diffuse_constraint = enable_diffuse_constraint
+        self.weight_diffuse_constraint = weight_diffuse_constraint
+
+        # Lazy import to avoid circular dependency
+        self._brdf_renderer = None
+
+    @property
+    def brdf_renderer(self):
+        if self._brdf_renderer is None:
+            from vggt.heads.brdf_renderer import BRDFRenderer
+            self._brdf_renderer = BRDFRenderer(render_downsample=self.render_downsample)
+        return self._brdf_renderer
+
+    def forward(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Compute SG-related losses.
+
+        Args:
+            predictions: Dict with keys like "sg_params", "albedo", "normal", etc.
+            batch: Dict with "images", optional "gt_sg", etc.
+
+        Returns:
+            Dict of loss tensors.
+        """
+        # --- Extract Phase and Dataset ---
+        phase_ratio = batch.get("phase_ratio", 0.0)
+        if isinstance(phase_ratio, torch.Tensor):
+            phase_ratio = phase_ratio.item()
+
+        dataset_name = batch.get("dataset_name", "unknown")
+        if isinstance(dataset_name, (list, tuple)):
+            dataset_name = dataset_name[0]
+
+        loss_dict = {}
+        total_sg_loss = torch.tensor(0.0, device=_get_device(predictions))
+
+        sg_params = predictions.get("sg_params")
+        if sg_params is None:
+            return loss_dict
+
+        # --- Repulsion Loss (Always active) ---
+        repulsion_val = repulsion_loss(sg_params, threshold=self.repulsion_threshold)
+        loss_dict["loss_sg_repulsion"] = repulsion_val
+        total_sg_loss = total_sg_loss + repulsion_val * self.weight_repulsion
+
+        # --- Phase Routing & BRDF Render Loss ---
+        compute_brdf = True
+        if dataset_name not in ["openroomsff", "hypersim"]:
+            if phase_ratio <= self.sg_phase2_end:
+                # Under phase 2, BRDF render is only for openroomsff and hypersim
+                compute_brdf = False
+
+        if compute_brdf:
+            brdf_render_val = self._compute_brdf_render_loss(predictions, batch)
+            if brdf_render_val is not None:
+                loss_dict["loss_brdf_render"] = brdf_render_val
+                total_sg_loss = total_sg_loss + brdf_render_val * self.weight_brdf_render
+
+        # --- SG L2 GT Loss (Phase 1, openroomsff only) ---
+        compute_l2 = False
+        if self.enable_sg_l2 and phase_ratio <= self.sg_phase1_end and dataset_name == "openroomsff":
+            compute_l2 = True
+            
+        if (compute_l2 or self.enable_hungarian) and "gt_sg" in batch and batch["gt_sg"] is not None:
+            # We use the Hungarian matching loss to solve the permutation ambiguity of L2 loss
+            weight = self.weight_sg_l2 if compute_l2 else self.weight_hungarian
+            hungarian_val = hungarian_matching_loss(sg_params, batch["gt_sg"])
+            loss_dict["loss_sg_l2"] = hungarian_val
+            total_sg_loss = total_sg_loss + hungarian_val * weight
+
+        # --- Env Map Log-L2 Loss (Phase 1, openroomsff only) ---
+        if self.enable_env_map_log_l2 and phase_ratio <= self.sg_phase1_end and dataset_name == "openroomsff":
+            if "gt_env_map" in batch and batch["gt_env_map"] is not None:
+                env_map_val = self._compute_env_map_log_l2_loss(sg_params, batch["gt_env_map"])
+                if env_map_val is not None:
+                    loss_dict["loss_sg_env_map_log_l2"] = env_map_val
+                    total_sg_loss = total_sg_loss + env_map_val * self.weight_env_map_log_l2
+
+        # --- Diffuse Irradiance Constraint (Hypersim only) ---
+        if self.enable_diffuse_constraint and dataset_name == "hypersim":
+            if "gt_diffuse_illumination" in batch and predictions.get("normal") is not None:
+                diffuse_val = diffuse_irradiance_constraint(
+                    sg_params, 
+                    predictions["normal"], 
+                    batch["gt_diffuse_illumination"], 
+                    batch.get("gt_mask")
+                )
+                loss_dict["loss_sg_diffuse_constraint"] = diffuse_val
+                total_sg_loss = total_sg_loss + diffuse_val * self.weight_diffuse_constraint
+
+        loss_dict["loss_sg_total"] = total_sg_loss
+        return loss_dict
+
+    def _compute_brdf_render_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Compute BRDF render loss: MSE(rendered, input_image).
+
+        Requires: albedo, normal, roughness, metallic, sg_params,
+                  world_points, pose_enc in predictions.
+                  images in batch.
+        """
+        required_pred_keys = ["albedo", "normal", "roughness", "metallic", "sg_params"]
+        for key in required_pred_keys:
+            if key not in predictions or predictions[key] is None:
+                return None
+
+        if "images" not in batch:
+            return None
+
+        # Get camera positions from predictions or batch
+        camera_pos = None
+        if "pose_enc" in predictions and predictions["pose_enc"] is not None:
+            from vggt.heads.brdf_renderer import compute_camera_positions
+            camera_pos = compute_camera_positions(predictions["pose_enc"])
+        elif "camera_pos" in batch:
+            camera_pos = batch["camera_pos"]
+
+        # Get point map from predictions or batch
+        point_map = predictions.get("world_points")
+        if point_map is None:
+            point_map = batch.get("gt_point_map")
+        if point_map is None or camera_pos is None:
+            return None
+
+        images = batch["images"]  # [B, S, 3, H, W]
+        images_hwc = images.permute(0, 1, 3, 4, 2).contiguous()  # [B, S, H, W, 3]
+
+        # Render using BRDF
+        rendered = self.brdf_renderer(
+            albedo=predictions["albedo"],
+            normal=predictions["normal"],
+            roughness=predictions["roughness"],
+            metallic=predictions["metallic"],
+            sg_params=predictions["sg_params"],
+            point_map=point_map,
+            camera_pos=camera_pos,
+            shading=predictions.get("shading"),
+        )
+
+        # Resize rendered to match image resolution if needed
+        if rendered.shape[2:4] != images_hwc.shape[2:4]:
+            B, S, H_r, W_r, C = rendered.shape
+            H_i, W_i = images_hwc.shape[2], images_hwc.shape[3]
+            rendered_flat = rendered.reshape(B * S, H_r, W_r, C).permute(0, 3, 1, 2)
+            rendered_flat = F.interpolate(
+                rendered_flat, size=(H_i, W_i), mode="bilinear", align_corners=False
+            )
+            rendered = rendered_flat.permute(0, 2, 3, 1).reshape(B, S, H_i, W_i, C)
+
+        # Apply mask if available
+        mask = batch.get("gt_mask")
+        if mask is not None:
+            if mask.ndim == 5 and mask.shape[-1] == 1:
+                mask = mask.squeeze(-1)
+            mask = mask > 0.5
+            mask_expanded = mask.unsqueeze(-1).expand_as(rendered)
+            if mask_expanded.sum() < 1:
+                return (rendered * 0.0).sum()
+            diff_sq = (rendered - images_hwc) ** 2
+            return diff_sq[mask_expanded].mean()
+
+        return F.mse_loss(rendered, images_hwc)
+
+    def _compute_env_map_log_l2_loss(self, sg_params, gt_env_map, resolution=(64, 128)):
+        """Compute Log-L2 loss between reconstructed and GT environment maps."""
+        B, S, K, _ = sg_params.shape
+
+        # Dataloader may return a python list for optional env-map fields.
+        if isinstance(gt_env_map, (list, tuple)):
+            if len(gt_env_map) == 0:
+                return None
+            if not all(isinstance(x, torch.Tensor) for x in gt_env_map):
+                return None
+            try:
+                gt_env_map = torch.stack(gt_env_map, dim=0)
+            except Exception:
+                return None
+
+        if not isinstance(gt_env_map, torch.Tensor):
+            return None
+
+        gt_env_map = gt_env_map.to(device=sg_params.device, dtype=sg_params.dtype)
+
+        # Accept [B, S, 3, H, W] or [B, S, H, W, 3].
+        if gt_env_map.ndim != 5:
+            return None
+
+        if gt_env_map.shape[0] != B or gt_env_map.shape[1] != S:
+            return None
+
+        if gt_env_map.shape[2] == 3:
+            gt_env_map_cf = gt_env_map
+        elif gt_env_map.shape[-1] == 3:
+            gt_env_map_cf = gt_env_map.permute(0, 1, 4, 2, 3).contiguous()
+        else:
+            return None
+
+        H_gt, W_gt = gt_env_map_cf.shape[-2:]
+        
+        # Reconstruct env map from SG
+        # We render at a lower resolution for efficiency
+        pred_env_map = render_env_map_from_sg(sg_params, height=resolution[0], width=resolution[1]) # [B, S, H, W, 3]
+        pred_env_map = pred_env_map.permute(0, 1, 4, 2, 3) # [B, S, 3, H, W]
+        
+        # Downsample GT to match pred resolution
+        gt_env_map_small = F.interpolate(
+            gt_env_map_cf.view(B*S, 3, H_gt, W_gt), 
+            size=resolution, 
+            mode="bilinear", 
+            align_corners=False
+        ).view(B, S, 3, resolution[0], resolution[1])
+        
+        # Log-L2 loss: MSE(log(p+1), log(g+1))
+        loss = F.mse_loss(torch.log1p(pred_env_map), torch.log1p(gt_env_map_small))
+        return loss
+
+
+# ============================================================================
+# Loss Functions
+# ============================================================================
+
+
+def repulsion_loss(
+    sg_params: torch.Tensor,
+    threshold: float = 0.9,
+) -> torch.Tensor:
+    """Repulsion loss to prevent SG lobes from collapsing to similar directions.
+
+    Penalizes pairs of lobes whose direction cosine similarity exceeds the threshold.
+    Loss = Σ_{i<j} max(0, cos_sim(μ_i, μ_j) - threshold)²
+
+    Args:
+        sg_params: [B, S, num_lobes, 7] — only directions [:, :, :, :3] are used.
+        threshold: Cosine similarity threshold above which penalty is applied.
+
+    Returns:
+        Scalar loss tensor.
+    """
+    if sg_params.ndim == 4:
+        B, S, L, _ = sg_params.shape
+        sg_params = sg_params.view(B * S, L, 7)
+        
+    directions = sg_params[:, :, :3]  # [B*S, num_lobes, 3]
+    directions = F.normalize(directions, p=2, dim=-1, eps=1e-8)
+
+    B_S, L, _ = directions.shape
+
+    # Compute pairwise cosine similarities: [B, L, L]
+    cos_sim = torch.bmm(directions, directions.transpose(1, 2))  # [B, L, L]
+
+    # Create upper-triangular mask (exclude diagonal and lower triangle).
+    # Expand over flattened batch-view dimension [B*S] to match cos_sim.
+    mask = torch.triu(torch.ones(L, L, device=cos_sim.device, dtype=torch.bool), diagonal=1)
+    mask = mask.unsqueeze(0).expand(B_S, -1, -1)  # [B*S, L, L]
+
+    # Extract upper-triangular values
+    cos_sim_pairs = cos_sim[mask]  # [B * L*(L-1)/2]
+
+    # Penalize pairs exceeding threshold
+    violation = torch.clamp(cos_sim_pairs - threshold, min=0.0)
+    loss = (violation ** 2).mean()
+
+    return loss
+
+
+def hungarian_matching_loss(
+    pred_sg: torch.Tensor,
+    gt_sg: torch.Tensor,
+) -> torch.Tensor:
+    """Hungarian matching loss for SG lobes.
+
+    Uses the Hungarian algorithm (scipy.optimize.linear_sum_assignment) to find
+    the optimal assignment between predicted and GT lobes, then computes the
+    L2 loss on matched pairs.
+
+    Args:
+        pred_sg: [B, S, num_pred_lobes, 7]
+        gt_sg:   [B, S, num_gt_lobes, 7]
+
+    Returns:
+        Scalar loss tensor.
+    """
+    if pred_sg.ndim == 4:
+        pred_sg = pred_sg.view(-1, pred_sg.shape[2], 7)
+    if gt_sg.ndim == 4:
+        gt_sg = gt_sg.view(-1, gt_sg.shape[2], 7)
+        
+    B_S = pred_sg.shape[0]
+    total_loss = torch.tensor(0.0, device=pred_sg.device)
+
+    for b in range(B_S):
+        pred = pred_sg[b]  # [num_pred, 7]
+        gt = gt_sg[b]      # [num_gt, 7]
+
+        num_pred = pred.shape[0]
+        num_gt = gt.shape[0]
+
+        # Compute cost matrix: L2 distance between all pairs
+        # pred: [num_pred, 1, 7], gt: [1, num_gt, 7]
+        cost = (pred.unsqueeze(1) - gt.unsqueeze(0)).pow(2).sum(dim=-1)  # [num_pred, num_gt]
+
+        # Solve assignment problem
+        cost_np = cost.detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(cost_np)
+
+        # Compute loss on matched pairs
+        matched_pred = pred[row_ind]
+        matched_gt = gt[col_ind]
+
+        # Weighted loss: direction uses cosine, sharpness + amplitude use L2
+        dir_loss = 1.0 - (
+            F.normalize(matched_pred[:, :3], dim=-1) *
+            F.normalize(matched_gt[:, :3], dim=-1)
+        ).sum(dim=-1).mean()
+
+        param_loss = F.mse_loss(matched_pred[:, 3:], matched_gt[:, 3:])
+
+        total_loss = total_loss + dir_loss + param_loss
+
+    return total_loss / max(B_S, 1)
+
+
+def diffuse_irradiance_constraint(
+    sg_params: torch.Tensor,
+    normal: torch.Tensor,
+    gt_diffuse: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Constraints SG to match GT diffuse illumination when integrated over normal.
+
+    Args:
+        sg_params: [B, S, L, 7] (mu: 3, lambda: 1, color: 3)
+        normal: [B, S, H, W, 3] (L2 normalized)
+        gt_diffuse: [B, S, H, W, 3]
+        mask: optional boolean mask
+    """
+    B, S, H, W, _ = normal.shape
+    L = sg_params.shape[2]
+
+    normals_flat = normal.view(B*S, H*W, 3) # [B*S, N, 3]
+    
+    if sg_params.ndim == 4:
+        sg_params = sg_params.view(B*S, L, 7)
+        
+    mu  = F.normalize(sg_params[:, :, :3], dim=-1) # [B*S, L, 3]
+    lam = sg_params[:, :, 3:4]                     # [B*S, L, 1]
+    col = sg_params[:, :, 4:7]                     # [B*S, L, 3]
+
+    pred_diffuse_flat = torch.zeros((B*S, H*W, 3), device=normal.device, dtype=normal.dtype)
+
+    for bs in range(B*S):
+        dot = torch.mm(normals_flat[bs], mu[bs].transpose(0, 1)) # [N, L]
+        w = torch.exp(lam[bs].transpose(0, 1) * (dot - 1.0))    # [N, L]
+        pred_diffuse_flat[bs] = (w.unsqueeze(-1) * col[bs].unsqueeze(0)).sum(dim=1) # [N, 3]
+
+    pred_diffuse = pred_diffuse_flat.view(B, S, H, W, 3)
+
+    if mask is not None:
+        if mask.ndim == 5 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        mask = mask > 0.5
+        mask_expanded = mask.unsqueeze(-1).expand_as(pred_diffuse)
+        if mask_expanded.sum() < 1:
+            return (pred_diffuse * 0.0).sum()
+        diff = (pred_diffuse - gt_diffuse)[mask_expanded]
+        return (diff ** 2).mean()
+    
+    return F.mse_loss(pred_diffuse, gt_diffuse)
+
+
+def render_env_map_from_sg(sg_params, height=64, width=128):
+    """Reconstruct an equirectangular environment map from SG parameters.
+
+    Args:
+        sg_params: [B, S, K, 7] (mu: 3, lambda: 1, color: 3)
+        height: Target resolution height
+        width: Target resolution width
+
+    Returns:
+        [B, S, height, width, 3] environment map
+    """
+    B, S, K, _ = sg_params.shape
+    device = sg_params.device
+    
+    # Create equirectangular direction grid
+    theta = torch.linspace(0, torch.pi, height, device=device)
+    phi = torch.linspace(0, 2 * torch.pi, width, device=device)
+    theta, phi = torch.meshgrid(theta, phi, indexing="ij")
+    
+    x = torch.sin(theta) * torch.cos(phi)
+    y = torch.cos(theta)
+    z = torch.sin(theta) * torch.sin(phi)
+    dirs = torch.stack([x, y, z], dim=-1).view(1, 1, height * width, 3) # [1, 1, N, 3]
+    
+    # SG parameters
+    mu  = F.normalize(sg_params[:, :, :, :3], dim=-1) # [B, S, K, 3]
+    lam = sg_params[:, :, :, 3:4]                     # [B, S, K, 1]
+    col = sg_params[:, :, :, 4:7]                     # [B, S, K, 3]
+    
+    # Flatten B, S for computation
+    mu = mu.view(B*S, K, 3)
+    lam = lam.view(B*S, K, 1)
+    col = col.view(B*S, K, 3)
+    dirs = dirs.view(1, height * width, 3)
+    
+    # Evaluate SG: sum_i color_i * exp(lambda_i * (dot(dir, mu_i) - 1))
+    # Using batches for memory efficiency if needed, but B*S is usually small.
+    # dot: [B*S, K, N]
+    dot = torch.bmm(mu, dirs.transpose(1, 2)) # [B*S, K, N]
+    
+    # w: [B*S, K, N]
+    w = torch.exp(lam * (dot - 1.0))
+    
+    # radiance: [B*S, 3, N]
+    radiance = torch.bmm(col.transpose(1, 2), w) 
+    
+    # Reshape back to [B, S, height, width, 3]
+    radiance = radiance.view(B, S, 3, height, width).permute(0, 1, 3, 4, 2)
+    return radiance
+
+
+def _get_device(d: dict) -> torch.device:
+    """Get device from the first tensor in a dict."""
+    for v in d.values():
+        if isinstance(v, torch.Tensor):
+            return v.device
+    return torch.device("cpu")

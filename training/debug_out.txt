@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/train-data-3-hdd/cerosop/vggt/vggt_origin/vggt/training/debug_matrixcity_ds.py", line 3, in <module>
+    from omegaconf import DictConfig
+ModuleNotFoundError: No module named 'omegaconf'
