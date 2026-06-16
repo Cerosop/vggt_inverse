@@ -557,6 +557,61 @@ class Trainer:
                         if head == "normal" and gt_t.shape[0] == 3: gt_t = (gt_t + 1.0) / 2.0
                         save_image(torch.clamp(gt_t, 0.0, 1.0), os.path.join(out_dir, f"gt_{head}.png"))
 
+                # --- Light token demos: SG environment map + BRDF-rendered image ---
+                # SG params are hard to visualize directly, so we render the SG lobes
+                # into an equirectangular env map. We also render the predicted
+                # materials + SG lighting through the BRDF renderer. pose_enc /
+                # world_points are present because the VGGT geometry heads run in val.
+                with torch.no_grad():
+                    sg = y_hat.get("sg_params")
+                    if sg is not None:
+                        try:
+                            from sg_loss import render_env_map_from_sg
+                            env = render_env_map_from_sg(
+                                sg[:1, img_idx:img_idx + 1].float(), height=128, width=256
+                            )  # [1, 1, 128, 256, 3], HDR radiance
+                            env_t = env[0, 0]
+                            env_t = env_t / (env_t + 1.0)  # Reinhard tone-map -> [0, 1)
+                            save_image(torch.clamp(env_t.permute(2, 0, 1), 0., 1.),
+                                       os.path.join(out_dir, "pred_env_map.png"))
+                        except Exception as e:
+                            logging.warning(f"[val demo] env_map render failed: {e}")
+
+                        gt_env = batch.get("gt_env_map")
+                        if isinstance(gt_env, torch.Tensor):
+                            try:
+                                ge = gt_env[0, img_idx].float()
+                                if ge.shape[-1] == 3 and ge.shape[0] != 3:
+                                    ge = ge.permute(2, 0, 1)  # [H,W,3] -> [3,H,W]
+                                ge = ge / (ge + 1.0)  # tone-map HDR env map
+                                save_image(torch.clamp(ge, 0., 1.),
+                                           os.path.join(out_dir, "gt_env_map.png"))
+                            except Exception as e:
+                                logging.warning(f"[val demo] gt_env_map save failed: {e}")
+
+                    render_keys = ["albedo", "normal", "roughness", "metallic",
+                                   "sg_params", "pose_enc", "world_points"]
+                    if all(y_hat.get(k) is not None for k in render_keys):
+                        try:
+                            from vggt.heads.brdf_renderer import BRDFRenderer, compute_camera_positions
+                            sl = slice(img_idx, img_idx + 1)
+                            cam_pos = compute_camera_positions(y_hat["pose_enc"][:1, sl].float())
+                            rendered = BRDFRenderer(render_downsample=2)(
+                                albedo=y_hat["albedo"][:1, sl].float(),
+                                normal=y_hat["normal"][:1, sl].float(),
+                                roughness=y_hat["roughness"][:1, sl].float(),
+                                metallic=y_hat["metallic"][:1, sl].float(),
+                                sg_params=y_hat["sg_params"][:1, sl].float(),
+                                point_map=y_hat["world_points"][:1, sl].float(),
+                                camera_pos=cam_pos,
+                                shading=(y_hat["shading"][:1, sl].float()
+                                         if y_hat.get("shading") is not None else None),
+                            )  # [1, 1, H, W, 3], already Reinhard tone-mapped in the renderer
+                            save_image(torch.clamp(rendered[0, 0].permute(2, 0, 1), 0., 1.),
+                                       os.path.join(out_dir, "pred_render.png"))
+                        except Exception as e:
+                            logging.warning(f"[val demo] BRDF render failed: {e}")
+
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
