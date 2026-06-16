@@ -158,4 +158,4 @@ examples/
 
 weight/
 
-training/config/
+training/config/*
