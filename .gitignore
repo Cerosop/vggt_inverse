@@ -157,3 +157,5 @@ diag_outputs*/
 examples/
 
 weight/
+
+training/config/
