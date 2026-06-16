@@ -69,6 +69,8 @@ class InverseRenderingLoss(nn.Module):
     weight_env_map_log_l2: float = 1.0
     enable_diffuse_constraint: bool = False
     weight_diffuse_constraint: float = 0.5
+    # BRDF render geometry source: "pred" (model camera/point heads) or "gt" (dataset).
+    brdf_geometry_source: str = "pred"
 
     # SSIM loss (per-head control via dict)
     ssim: Optional[Dict] = None
@@ -175,6 +177,7 @@ class InverseRenderingLoss(nn.Module):
                 weight_env_map_log_l2=self.weight_env_map_log_l2,
                 enable_diffuse_constraint=self.enable_diffuse_constraint,
                 weight_diffuse_constraint=self.weight_diffuse_constraint,
+                geometry_source=self.brdf_geometry_source,
             )
 
     def forward(

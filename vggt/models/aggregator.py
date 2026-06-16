@@ -161,18 +161,28 @@ class Aggregator(nn.Module):
         # Resolved global base rank: use lora_global_base_rank if provided, else lora_rank
         _global_base_rank = lora_global_base_rank if lora_global_base_rank is not None else lora_rank
 
+        # When training the light token, the per-frame pathway is frozen entirely:
+        # no LoRA is added to the frame blocks so only the global pathway adapts.
+        # (Has no effect unless LoRA is enabled.)
+        self.lora_skip_frame = enable_lora and enable_light_token
+
         # LoRA dual-path support
         self.enable_lora = enable_lora
         if enable_lora:
             from vggt.layers.lora import LoRABlock
-            self.lora_frame_blocks = nn.ModuleList([
-                LoRABlock(
-                    blk,
-                    rank=lora_tail_rank if (lora_tail_layers > 0 and i >= depth - lora_tail_layers) else lora_rank,
-                    alpha=lora_alpha,
-                )
-                for i, blk in enumerate(self.frame_blocks)
-            ])
+            if self.lora_skip_frame:
+                # Frame blocks stay frozen (no adapter); the LoRA frame step routes
+                # through the original frozen frame_blocks in the forward pass.
+                self.lora_frame_blocks = None
+            else:
+                self.lora_frame_blocks = nn.ModuleList([
+                    LoRABlock(
+                        blk,
+                        rank=lora_tail_rank if (lora_tail_layers > 0 and i >= depth - lora_tail_layers) else lora_rank,
+                        alpha=lora_alpha,
+                    )
+                    for i, blk in enumerate(self.frame_blocks)
+                ])
             self.lora_global_blocks = nn.ModuleList([
                 LoRABlock(
                     blk,
@@ -181,6 +191,9 @@ class Aggregator(nn.Module):
                 )
                 for i, blk in enumerate(self.global_blocks)
             ])
+        else:
+            self.lora_frame_blocks = None
+            self.lora_global_blocks = None
 
     def __build_patch_embed__(
         self,
@@ -399,12 +412,13 @@ class Aggregator(nn.Module):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
-        # If needed, reshape tokens or positions:
+        # If needed, reshape tokens or positions (reshape, not view: after the light
+        # token is split off the tensor can be non-contiguous).
         if tokens.shape != (B * S, P, C):
-            tokens = tokens.view(B, S, P, C).view(B * S, P, C)
+            tokens = tokens.reshape(B * S, P, C)
 
         if pos is not None and pos.shape != (B * S, P, 2):
-            pos = pos.view(B, S, P, 2).view(B * S, P, 2)
+            pos = pos.reshape(B * S, P, 2)
 
         # Append light token (no RoPE position — set to 0)
         use_lt = light_token is not None
@@ -428,7 +442,7 @@ class Aggregator(nn.Module):
                 light_token = tokens[:, -1:, :]
                 intermediates.append(patch_tokens_out.reshape(B, S, P, C))
             else:
-                intermediates.append(tokens.view(B, S, P, C))
+                intermediates.append(tokens.reshape(B, S, P, C))
 
         if use_lt:
             tokens = patch_tokens_out
@@ -444,11 +458,13 @@ class Aggregator(nn.Module):
         the LoRA path. This lets the original-block (full-finetune) path also
         update the light token.
         """
+        # reshape (not view): after the light token is split off the tensor can be
+        # non-contiguous, which would make .view() raise.
         if tokens.shape != (B, S * P, C):
-            tokens = tokens.view(B, S, P, C).view(B, S * P, C)
+            tokens = tokens.reshape(B, S * P, C)
 
         if pos is not None and pos.shape != (B, S * P, 2):
-            pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+            pos = pos.reshape(B, S * P, 2)
 
         use_lt = light_token is not None
         if use_lt:
@@ -471,7 +487,7 @@ class Aggregator(nn.Module):
                 light_token = tokens[:, -S:, :]
                 intermediates.append(patch_tokens_out.reshape(B, S, P, C))
             else:
-                intermediates.append(tokens.view(B, S, P, C))
+                intermediates.append(tokens.reshape(B, S, P, C))
 
         if use_lt:
             tokens = patch_tokens_out
@@ -483,7 +499,12 @@ class Aggregator(nn.Module):
     # ------------------------------------------------------------------
 
     def _process_frame_attention_lora(self, tokens, B, S, P, C, frame_idx, pos=None, light_token=None):
-        """Process frame attention using LoRA-adapted blocks."""
+        """Process frame attention using LoRA-adapted blocks.
+
+        When ``lora_skip_frame`` is set (light-token training), no LoRA is applied
+        to the frame blocks: the original frozen ``frame_blocks`` are used instead,
+        so the per-frame representation stays fixed and only the global pathway adapts.
+        """
         if tokens.shape != (B * S, P, C):
             tokens = tokens.reshape(B * S, P, C)
 
@@ -498,12 +519,15 @@ class Aggregator(nn.Module):
                 lt_pos = torch.zeros(B * S, 1, 2, device=pos.device, dtype=pos.dtype)
                 pos = torch.cat([pos, lt_pos], dim=1)
 
+        # Frozen frame blocks when frame LoRA is skipped, else the LoRA-adapted ones.
+        frame_block_list = self.frame_blocks if self.lora_skip_frame else self.lora_frame_blocks
+
         intermediates = []
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.lora_frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(frame_block_list[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.lora_frame_blocks[frame_idx](tokens, pos=pos)
+                tokens = frame_block_list[frame_idx](tokens, pos=pos)
             frame_idx += 1
             
             if use_lt:

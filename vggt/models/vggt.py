@@ -23,7 +23,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  inverse_frames_chunk_size=8, skip_vggt_heads_in_train=False,
                  inverse_head_type=None, inverse_head_pos_embed=None,
                  enable_light_token=False, sg_num_lobes=24, sg_hidden_dim=512,
-                 enable_brdf_render=False,
+                 enable_brdf_render=False, brdf_geometry_source="pred",
                  resnext_pretrained=True,
                  resnext_disable_layer34=False,
                  enable_dynamic_weighting=False,
@@ -32,6 +32,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         self.skip_vggt_heads_in_train = skip_vggt_heads_in_train
         self.enable_brdf_render = enable_brdf_render
+        self.brdf_geometry_source = brdf_geometry_source
         self.enable_light_token = enable_light_token
 
         self.aggregator = Aggregator(
@@ -171,23 +172,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["vis"] = vis
                 predictions["conf"] = conf
 
-        # --- During training with BRDF render: need camera/point from LoRA tokens ---
-        # When skip_vggt_heads_in_train is True but we need geometry for BRDF rendering,
-        # run camera/point heads on LoRA tokens (no grad needed, just for render loss).
-        if (self.training and self.skip_vggt_heads_in_train
-                and self.enable_brdf_render
-                and lora_tokens_list is not None):
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=False):
-                    if self.camera_head is not None and "pose_enc" not in predictions:
-                        pose_enc_list = self.camera_head(lora_tokens_list)
-                        predictions["pose_enc"] = pose_enc_list[-1]
+        # --- Geometry for BRDF render loss ---
+        # When using predicted geometry ("pred"), run the (frozen) camera/point heads
+        # under no_grad so the renderer gets fixed geometry without the render loss
+        # back-propagating into the backbone. Works in both full mode (original tokens)
+        # and LoRA mode (LoRA tokens) — VGGT heads are otherwise skipped during training.
+        # In "gt" mode the dataset supplies geometry, so this is skipped.
+        if (self.training and self.enable_brdf_render
+                and getattr(self, "brdf_geometry_source", "pred") == "pred"):
+            geom_tokens = lora_tokens_list if lora_tokens_list is not None else aggregated_tokens_list
+            if geom_tokens is not None:
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(enabled=False):
+                        if self.camera_head is not None and "pose_enc" not in predictions:
+                            pose_enc_list = self.camera_head(geom_tokens)
+                            predictions["pose_enc"] = pose_enc_list[-1]
 
-                    if self.point_head is not None and "world_points" not in predictions:
-                        pts3d, pts3d_conf = self.point_head(
-                            lora_tokens_list, images=images, patch_start_idx=patch_start_idx
-                        )
-                        predictions["world_points"] = pts3d
+                        if self.point_head is not None and "world_points" not in predictions:
+                            pts3d, pts3d_conf = self.point_head(
+                                geom_tokens, images=images, patch_start_idx=patch_start_idx
+                            )
+                            predictions["world_points"] = pts3d
 
         # --- Inverse rendering heads (NEW, trainable) ---
         if self.inverse_heads is not None:

@@ -38,16 +38,40 @@ def _apply_finetune_mode(cfg: DictConfig) -> None:
     use_lora = (mode == "lora")
     OmegaConf.update(cfg, "inverse_rendering.enable_lora", use_lora, merge=False)
 
+    # When training the light token, keep the per-frame pathway frozen and let only
+    # the global pathway adapt:
+    #   - full mode: unfreeze only the global blocks (frame blocks stay frozen).
+    #   - lora mode: no LoRA on the frame blocks (handled in the Aggregator) and the
+    #     original frame blocks stay frozen (already in the frozen list).
+    light_token = bool(inv.get("enable_light_token", False))
+
     optim = cfg.get("optim", None)
     if optim is None:
         return
 
     # --- Adjust frozen_module_names ---
+    # We explicitly add/remove the frame & global block patterns so the result is
+    # correct regardless of whether the user left them in `frozen_module_names`.
+    def _has_orig(patterns, substr):
+        return any(substr in p and "lora" not in p for p in patterns)
+
     frozen = optim.get("frozen_module_names", None)
     if frozen is not None:
         new_frozen = list(frozen)
-        if not use_lora:
-            # In full mode, frame/global blocks are trained directly — don't freeze them.
+        if use_lora:
+            # LoRA: the original frame & global blocks are always frozen (only the
+            # adapters train) — ensure both are in the frozen list.
+            if not _has_orig(new_frozen, "frame_blocks"):
+                new_frozen.append("*aggregator.frame_blocks*")
+            if not _has_orig(new_frozen, "global_blocks"):
+                new_frozen.append("*aggregator.global_blocks*")
+        elif light_token:
+            # full + light: freeze the per-frame blocks, train ONLY the global blocks.
+            new_frozen = [p for p in new_frozen if ("global_blocks" not in p)]
+            if not _has_orig(new_frozen, "frame_blocks"):
+                new_frozen.append("*aggregator.frame_blocks*")
+        else:
+            # full: train both frame & global blocks directly — unfreeze them.
             new_frozen = [
                 p for p in new_frozen
                 if ("frame_blocks" not in p) and ("global_blocks" not in p)
@@ -70,6 +94,7 @@ def _apply_finetune_mode(cfg: DictConfig) -> None:
     for c in gc_configs:
         names = _names(c)
         is_lora_entry = any("lora_frame_blocks" in n or "lora_global_blocks" in n for n in names)
+        is_frame_lora_entry = any("lora_frame_blocks" in n for n in names)
         is_block_entry = any(
             ("frame_blocks" in n and "lora_" not in n) or
             ("global_blocks" in n and "lora_" not in n)
@@ -79,6 +104,9 @@ def _apply_finetune_mode(cfg: DictConfig) -> None:
             # Drop any direct frame/global block clip entries (those layers are frozen).
             if is_block_entry and not is_lora_entry:
                 continue
+            # Light-token training: frame LoRA is not built, so drop its clip entry.
+            if light_token and is_frame_lora_entry:
+                continue
         else:
             # Drop lora_* entries (those layers don't exist in full mode).
             if is_lora_entry:
@@ -87,7 +115,9 @@ def _apply_finetune_mode(cfg: DictConfig) -> None:
 
     if not use_lora:
         existing_names_flat = [n for c in new_gc_configs for n in _names(c)]
-        if not any("frame_blocks" in n for n in existing_names_flat):
+        # Full mode trains the original blocks, so they need clip entries — except the
+        # frame blocks stay frozen during light-token training, so only add global then.
+        if not light_token and not any("frame_blocks" in n for n in existing_names_flat):
             new_gc_configs.append(OmegaConf.create({
                 "module_name": ["aggregator.frame_blocks"],
                 "max_norm": 1.0,

@@ -44,8 +44,12 @@ class SGLoss(nn.Module):
         weight_env_map_log_l2: float = 1.0,
         enable_diffuse_constraint: bool = False,
         weight_diffuse_constraint: float = 0.5,
+        geometry_source: str = "pred",
     ):
         super().__init__()
+        # BRDF render geometry source: "pred" (model camera/point head predictions)
+        # or "gt" (dataset-provided camera_pos / gt_point_map).
+        self.geometry_source = geometry_source
         self.weight_brdf_render = weight_brdf_render
         self.weight_repulsion = weight_repulsion
         self.repulsion_threshold = repulsion_threshold
@@ -140,14 +144,25 @@ class SGLoss(nn.Module):
                     loss_dict["loss_sg_env_map_log_l2"] = env_map_val
                     total_sg_loss = total_sg_loss + env_map_val * self.weight_env_map_log_l2
 
-        # --- Diffuse Irradiance Constraint (Hypersim only) ---
-        if self.enable_diffuse_constraint and dataset_name == "hypersim":
-            if "gt_diffuse_illumination" in batch and predictions.get("normal") is not None:
+        # --- Diffuse Irradiance Constraint ---
+        # The per-frame diffuse illumination GT is the shading image (shading.png ->
+        # gt_shading); `gt_diffuse_illumination` is kept as an optional override if a
+        # dataset ever provides a dedicated HDR diffuse map. Fires on any dataset that
+        # provides a shading GT (e.g. openroomsff, hypersim).
+        # NOTE: the SG-derived diffuse irradiance is HDR ([0, inf), softplus amplitudes)
+        # whereas the shading GT is LDR [0, 1], so it is Reinhard tone-mapped before the
+        # comparison (see diffuse_irradiance_constraint, tonemap=True).
+        if self.enable_diffuse_constraint and predictions.get("normal") is not None:
+            gt_diffuse = batch.get("gt_diffuse_illumination")
+            if gt_diffuse is None:
+                gt_diffuse = batch.get("gt_shading")
+            if gt_diffuse is not None:
                 diffuse_val = diffuse_irradiance_constraint(
-                    sg_params, 
-                    predictions["normal"], 
-                    batch["gt_diffuse_illumination"], 
-                    batch.get("gt_mask")
+                    sg_params,
+                    predictions["normal"],
+                    gt_diffuse,
+                    batch.get("gt_mask"),
+                    tonemap=True,
                 )
                 loss_dict["loss_sg_diffuse_constraint"] = diffuse_val
                 total_sg_loss = total_sg_loss + diffuse_val * self.weight_diffuse_constraint
@@ -174,18 +189,21 @@ class SGLoss(nn.Module):
         if "images" not in batch:
             return None
 
-        # Get camera positions from predictions or batch
+        # Geometry source: "pred" uses the model's camera/point head predictions,
+        # "gt" uses dataset-provided geometry (camera_pos / gt_point_map). Defaults
+        # to "pred" (the dataset does not yet ship geometry GT).
         camera_pos = None
-        if "pose_enc" in predictions and predictions["pose_enc"] is not None:
-            from vggt.heads.brdf_renderer import compute_camera_positions
-            camera_pos = compute_camera_positions(predictions["pose_enc"])
-        elif "camera_pos" in batch:
-            camera_pos = batch["camera_pos"]
-
-        # Get point map from predictions or batch
-        point_map = predictions.get("world_points")
-        if point_map is None:
+        point_map = None
+        if self.geometry_source == "gt":
+            if "camera_pos" in batch:
+                camera_pos = batch["camera_pos"]
             point_map = batch.get("gt_point_map")
+        else:  # "pred"
+            if predictions.get("pose_enc") is not None:
+                from vggt.heads.brdf_renderer import compute_camera_positions
+                camera_pos = compute_camera_positions(predictions["pose_enc"])
+            point_map = predictions.get("world_points")
+
         if point_map is None or camera_pos is None:
             return None
 
@@ -214,17 +232,20 @@ class SGLoss(nn.Module):
             )
             rendered = rendered_flat.permute(0, 2, 3, 1).reshape(B, S, H_i, W_i, C)
 
-        # Apply mask if available
+        # Apply mask if available. An all-zero gt_mask is a placeholder for datasets
+        # that ship no mask.png (e.g. openroomsff) — treat it as "no mask" and
+        # supervise the full image rather than returning 0 (which silently disabled
+        # the render loss on those datasets).
         mask = batch.get("gt_mask")
         if mask is not None:
             if mask.ndim == 5 and mask.shape[-1] == 1:
                 mask = mask.squeeze(-1)
             mask = mask > 0.5
             mask_expanded = mask.unsqueeze(-1).expand_as(rendered)
-            if mask_expanded.sum() < 1:
-                return (rendered * 0.0).sum()
-            diff_sq = (rendered - images_hwc) ** 2
-            return diff_sq[mask_expanded].mean()
+            if mask_expanded.sum() >= 1:
+                diff_sq = (rendered - images_hwc) ** 2
+                return diff_sq[mask_expanded].mean()
+            # else: empty/placeholder mask -> fall through to full-image MSE
 
         return F.mse_loss(rendered, images_hwc)
 
@@ -359,30 +380,34 @@ def hungarian_matching_loss(
         pred = pred_sg[b]  # [num_pred, 7]
         gt = gt_sg[b]      # [num_gt, 7]
 
-        num_pred = pred.shape[0]
-        num_gt = gt.shape[0]
+        # Decompose into comparable scales before matching/scoring. Sharpness spans
+        # [1, 1000] and amplitude is HDR ([0, inf)); comparing them with raw L2 makes
+        # the loss explode (a sharpness diff of a few hundred squares to tens of
+        # thousands) and makes the assignment ignore direction. Use cosine distance
+        # for direction, log-space for sharpness, and log1p for amplitude so every
+        # term is O(1).
+        p_dir = F.normalize(pred[:, :3], dim=-1)           # [P, 3]
+        g_dir = F.normalize(gt[:, :3], dim=-1)             # [G, 3]
+        p_logsh = torch.log(pred[:, 3:4].clamp(min=1e-3))  # [P, 1]
+        g_logsh = torch.log(gt[:, 3:4].clamp(min=1e-3))    # [G, 1]
+        p_logamp = torch.log1p(pred[:, 4:7].clamp(min=0.0))  # [P, 3]
+        g_logamp = torch.log1p(gt[:, 4:7].clamp(min=0.0))    # [G, 3]
 
-        # Compute cost matrix: L2 distance between all pairs
-        # pred: [num_pred, 1, 7], gt: [1, num_gt, 7]
-        cost = (pred.unsqueeze(1) - gt.unsqueeze(0)).pow(2).sum(dim=-1)  # [num_pred, num_gt]
+        # Cost matrix [P, G]: direction cosine distance + log-sharpness + log-amplitude.
+        dir_cost = 1.0 - p_dir @ g_dir.t()                 # [P, G]
+        sh_cost = (p_logsh - g_logsh.t()) ** 2             # [P, G]
+        amp_cost = torch.cdist(p_logamp, g_logamp) ** 2    # [P, G]
+        cost = dir_cost + sh_cost + amp_cost
 
         # Solve assignment problem
-        cost_np = cost.detach().cpu().numpy()
-        row_ind, col_ind = linear_sum_assignment(cost_np)
+        row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
 
-        # Compute loss on matched pairs
-        matched_pred = pred[row_ind]
-        matched_gt = gt[col_ind]
+        # Loss on matched pairs (same balanced terms).
+        dir_loss = (1.0 - (p_dir[row_ind] * g_dir[col_ind]).sum(dim=-1)).mean()
+        sh_loss = F.mse_loss(p_logsh[row_ind], g_logsh[col_ind])
+        amp_loss = F.mse_loss(p_logamp[row_ind], g_logamp[col_ind])
 
-        # Weighted loss: direction uses cosine, sharpness + amplitude use L2
-        dir_loss = 1.0 - (
-            F.normalize(matched_pred[:, :3], dim=-1) *
-            F.normalize(matched_gt[:, :3], dim=-1)
-        ).sum(dim=-1).mean()
-
-        param_loss = F.mse_loss(matched_pred[:, 3:], matched_gt[:, 3:])
-
-        total_loss = total_loss + dir_loss + param_loss
+        total_loss = total_loss + dir_loss + sh_loss + amp_loss
 
     return total_loss / max(B_S, 1)
 
@@ -392,14 +417,17 @@ def diffuse_irradiance_constraint(
     normal: torch.Tensor,
     gt_diffuse: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
+    tonemap: bool = True,
 ) -> torch.Tensor:
     """Constraints SG to match GT diffuse illumination when integrated over normal.
 
     Args:
         sg_params: [B, S, L, 7] (mu: 3, lambda: 1, color: 3)
         normal: [B, S, H, W, 3] (L2 normalized)
-        gt_diffuse: [B, S, H, W, 3]
+        gt_diffuse: [B, S, H, W, 3] — typically the shading GT (LDR, [0, 1]).
         mask: optional boolean mask
+        tonemap: if True, Reinhard tone-map the (HDR) SG diffuse irradiance to [0, 1)
+            before comparison, so it matches the LDR shading GT scale.
     """
     B, S, H, W, _ = normal.shape
     L = sg_params.shape[2]
@@ -422,16 +450,23 @@ def diffuse_irradiance_constraint(
 
     pred_diffuse = pred_diffuse_flat.view(B, S, H, W, 3)
 
+    # SG diffuse irradiance is HDR ([0, inf)); the shading GT is LDR [0, 1].
+    # Reinhard tone-map brings the prediction into [0, 1) for a comparable scale.
+    if tonemap:
+        pred_diffuse = pred_diffuse / (pred_diffuse + 1.0)
+
+    # An all-zero gt_mask is a placeholder for datasets without a mask.png — treat
+    # it as "no mask" (supervise the full image) instead of returning 0.
     if mask is not None:
         if mask.ndim == 5 and mask.shape[-1] == 1:
             mask = mask.squeeze(-1)
         mask = mask > 0.5
         mask_expanded = mask.unsqueeze(-1).expand_as(pred_diffuse)
-        if mask_expanded.sum() < 1:
-            return (pred_diffuse * 0.0).sum()
-        diff = (pred_diffuse - gt_diffuse)[mask_expanded]
-        return (diff ** 2).mean()
-    
+        if mask_expanded.sum() >= 1:
+            diff = (pred_diffuse - gt_diffuse)[mask_expanded]
+            return (diff ** 2).mean()
+        # else: empty/placeholder mask -> fall through to full-image MSE
+
     return F.mse_loss(pred_diffuse, gt_diffuse)
 
 
@@ -472,8 +507,9 @@ def render_env_map_from_sg(sg_params, height=64, width=128):
     
     # Evaluate SG: sum_i color_i * exp(lambda_i * (dot(dir, mu_i) - 1))
     # Using batches for memory efficiency if needed, but B*S is usually small.
-    # dot: [B*S, K, N]
-    dot = torch.bmm(mu, dirs.transpose(1, 2)) # [B*S, K, N]
+    # dot: [B*S, K, N]. Use matmul (not bmm) so the shared [1, N, 3] direction grid
+    # broadcasts across the B*S batch instead of raising a batch-size mismatch.
+    dot = torch.matmul(mu, dirs.transpose(1, 2)) # [B*S, K, 3] @ [1, 3, N] -> [B*S, K, N]
     
     # w: [B*S, K, N]
     w = torch.exp(lam * (dot - 1.0))
