@@ -283,24 +283,37 @@ class SGLoss(nn.Module):
         else:
             return None
 
+        # Some OpenRooms HDR env maps contain a few inf/nan pixels (corrupt HDR capture
+        # / SG-fit overflow). Treat those as bad and EXCLUDE them from the loss (do not
+        # supervise the prediction toward a fake value). Build a validity mask from the
+        # original GT, then sanitize so the arithmetic stays finite.
+        valid_cf = torch.isfinite(gt_env_map_cf).all(dim=2, keepdim=True).to(gt_env_map_cf.dtype)  # [B,S,1,H,W]
+        gt_env_map_cf = torch.nan_to_num(gt_env_map_cf, nan=0.0, posinf=0.0, neginf=0.0)
+
         H_gt, W_gt = gt_env_map_cf.shape[-2:]
-        
-        # Reconstruct env map from SG
-        # We render at a lower resolution for efficiency
-        pred_env_map = render_env_map_from_sg(sg_params, height=resolution[0], width=resolution[1]) # [B, S, H, W, 3]
-        pred_env_map = pred_env_map.permute(0, 1, 4, 2, 3) # [B, S, 3, H, W]
-        
-        # Downsample GT to match pred resolution
+
+        # Reconstruct env map from SG (rendered at a lower resolution for efficiency)
+        pred_env_map = render_env_map_from_sg(sg_params, height=resolution[0], width=resolution[1])  # [B, S, h, w, 3]
+        pred_env_map = pred_env_map.permute(0, 1, 4, 2, 3)  # [B, S, 3, h, w]
+
+        # Downsample GT and the validity mask to the pred resolution.
         gt_env_map_small = F.interpolate(
-            gt_env_map_cf.view(B*S, 3, H_gt, W_gt), 
-            size=resolution, 
-            mode="bilinear", 
-            align_corners=False
+            gt_env_map_cf.view(B * S, 3, H_gt, W_gt),
+            size=resolution, mode="bilinear", align_corners=False,
         ).view(B, S, 3, resolution[0], resolution[1])
-        
-        # Log-L2 loss: MSE(log(p+1), log(g+1))
-        loss = F.mse_loss(torch.log1p(pred_env_map), torch.log1p(gt_env_map_small))
-        return loss
+        valid_small = F.interpolate(
+            valid_cf.view(B * S, 1, H_gt, W_gt),
+            size=resolution, mode="bilinear", align_corners=False,
+        ).view(B, S, 1, resolution[0], resolution[1])
+        # Keep only fully-valid downsampled pixels (no corrupt source pixel mixed in).
+        valid_small = (valid_small > 0.999).to(pred_env_map.dtype)
+
+        # Masked Log-L2: MSE(log(p+1), log(g+1)) over valid GT pixels only.
+        per_elem = (torch.log1p(pred_env_map) - torch.log1p(gt_env_map_small)) ** 2  # [B,S,3,h,w]
+        denom = valid_small.sum() * per_elem.shape[2]  # * channels
+        if float(denom) < 1.0:
+            return None  # no valid GT pixels in this batch
+        return (per_elem * valid_small).sum() / denom
 
 
 # ============================================================================
@@ -372,13 +385,21 @@ def hungarian_matching_loss(
         pred_sg = pred_sg.view(-1, pred_sg.shape[2], 7)
     if gt_sg.ndim == 4:
         gt_sg = gt_sg.view(-1, gt_sg.shape[2], 7)
-        
+
     B_S = pred_sg.shape[0]
     total_loss = torch.tensor(0.0, device=pred_sg.device)
 
     for b in range(B_S):
         pred = pred_sg[b]  # [num_pred, 7]
         gt = gt_sg[b]      # [num_gt, 7]
+
+        # SG GT is fitted from HDR env maps and can contain inf/nan lobes in a few
+        # corrupt scenes. Drop those lobes so they are neither matched nor supervised
+        # (treat the bad GT value as absent rather than as a real zero lobe).
+        finite_gt = torch.isfinite(gt).all(dim=-1)
+        if not bool(finite_gt.any()):
+            continue
+        gt = gt[finite_gt]
 
         # Decompose into comparable scales before matching/scoring. Sharpness spans
         # [1, 1000] and amplitude is HDR ([0, inf)); comparing them with raw L2 makes
@@ -455,19 +476,22 @@ def diffuse_irradiance_constraint(
     if tonemap:
         pred_diffuse = pred_diffuse / (pred_diffuse + 1.0)
 
-    # An all-zero gt_mask is a placeholder for datasets without a mask.png — treat
-    # it as "no mask" (supervise the full image) instead of returning 0.
+    # Valid pixels = finite GT, intersected with a real spatial mask if one is given.
+    # Non-finite GT pixels are excluded (treated as bad, not supervised). An all-zero
+    # gt_mask is a placeholder for datasets without a mask.png and is ignored.
+    valid = torch.isfinite(gt_diffuse).all(dim=-1)  # [B, S, H, W]
     if mask is not None:
         if mask.ndim == 5 and mask.shape[-1] == 1:
             mask = mask.squeeze(-1)
         mask = mask > 0.5
-        mask_expanded = mask.unsqueeze(-1).expand_as(pred_diffuse)
-        if mask_expanded.sum() >= 1:
-            diff = (pred_diffuse - gt_diffuse)[mask_expanded]
-            return (diff ** 2).mean()
-        # else: empty/placeholder mask -> fall through to full-image MSE
+        if mask.sum() >= 1:  # ignore all-zero placeholder masks
+            valid = valid & mask
 
-    return F.mse_loss(pred_diffuse, gt_diffuse)
+    gt_diffuse = torch.nan_to_num(gt_diffuse, nan=0.0, posinf=0.0, neginf=0.0)
+    valid_expanded = valid.unsqueeze(-1).expand_as(pred_diffuse)
+    if valid_expanded.sum() < 1:
+        return (pred_diffuse * 0.0).sum()
+    return ((pred_diffuse - gt_diffuse)[valid_expanded] ** 2).mean()
 
 
 def render_env_map_from_sg(sg_params, height=64, width=128):
