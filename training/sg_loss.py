@@ -210,7 +210,10 @@ class SGLoss(nn.Module):
         images = batch["images"]  # [B, S, 3, H, W]
         images_hwc = images.permute(0, 1, 3, 4, 2).contiguous()  # [B, S, H, W, 3]
 
-        # Render using BRDF
+        # Render using BRDF.
+        # NOTE: do NOT pass `shading` here. `shading` is the predicted full lighting
+        # term; the BRDF render already computes lighting from the SG, so multiplying
+        # by shading double-counts illumination and darkens the render ~1.4x.
         rendered = self.brdf_renderer(
             albedo=predictions["albedo"],
             normal=predictions["normal"],
@@ -219,7 +222,6 @@ class SGLoss(nn.Module):
             sg_params=predictions["sg_params"],
             point_map=point_map,
             camera_pos=camera_pos,
-            shading=predictions.get("shading"),
         )
 
         # Resize rendered to match image resolution if needed

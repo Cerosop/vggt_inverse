@@ -135,12 +135,16 @@ class BRDFRenderer(nn.Module):
             ndotl = (normal_r * light_dir).sum(dim=-1, keepdim=True)  # [B, S, Hr, Wr, 1]
             ndotl = torch.clamp(ndotl, min=0.0)
 
-            # SG irradiance: amplitude * exp(sharpness * (dot(n, mu) - 1)) * (2π / sharpness)
-            # Approximation for diffuse SG integral
+            # SG value along the surface/lobe alignment (used for the specular term).
             sg_eval = l_amp * torch.exp(l_sharp * (ndotl - 1.0))  # [B, S, Hr, Wr, 3]
 
-            # Diffuse contribution: Lambertian
-            diffuse_contrib = sg_eval  # Already multiplied by SG evaluation
+            # Diffuse: treat each SG lobe as a directional light whose intensity is the
+            # lobe's TOTAL flux  ∫ G dω = amp * 2π * (1 - e^{-2λ}) / λ , then Lambertian
+            # shade it (the 1/π is applied once below). The previous code used the SG
+            # *value* (no solid-angle integral), which under-estimated irradiance for
+            # broad lobes and made renders ~10x too dark.
+            lobe_flux = l_amp * (2.0 * math.pi * (1.0 - torch.exp(-2.0 * l_sharp)) / l_sharp)  # [B,S,1,1,3]
+            diffuse_contrib = lobe_flux * ndotl  # [B, S, Hr, Wr, 3]
 
             # --- Specular: Simplified SG × GGX ---
             # Half vector
@@ -179,8 +183,14 @@ class BRDFRenderer(nn.Module):
         if shading_r is not None:
             rendered = rendered * shading_r
 
-        # Simple Reinhard tone mapping to [0, 1] for loss computation
+        # Simple Reinhard tone mapping of the (linear) radiance to [0, 1].
         rendered = rendered / (rendered + 1.0)
+
+        # sRGB gamma encode. The GT images are sRGB-encoded but the render is linear
+        # radiance; comparing/displaying linear vs sRGB makes the render ~2x too dark
+        # (verified: linear mean 0.22 vs input 0.43; gamma-encoded 0.47 ≈ input).
+        # clamp(min) bounds the gamma gradient on near-black pixels.
+        rendered = rendered.clamp(min=1e-5).pow(1.0 / 2.2)
 
         # Upsample back to original resolution if downsampled
         if ds > 1:

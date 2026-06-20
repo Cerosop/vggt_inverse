@@ -604,11 +604,36 @@ class Trainer:
                                 sg_params=y_hat["sg_params"][:1, sl].float(),
                                 point_map=y_hat["world_points"][:1, sl].float(),
                                 camera_pos=cam_pos,
-                                shading=(y_hat["shading"][:1, sl].float()
-                                         if y_hat.get("shading") is not None else None),
-                            )  # [1, 1, H, W, 3], already Reinhard tone-mapped in the renderer
+                            )  # [1, 1, H, W, 3]; BRDF computes lighting from SG, so no shading multiply
                             save_image(torch.clamp(rendered[0, 0].permute(2, 0, 1), 0., 1.),
                                        os.path.join(out_dir, "pred_render.png"))
+
+                            # Renderer "ceiling" check: render with GT materials + GT SG
+                            # (+ predicted geometry) so we can see how close the renderer
+                            # itself can get to the input given perfect materials/lighting.
+                            gt_mat_keys = ["gt_albedo", "gt_normal", "gt_roughness", "gt_metallic"]
+                            if (batch.get("gt_sg") is not None
+                                    and all(batch.get(k) is not None for k in gt_mat_keys)):
+                                def _match(t):  # resize GT map to the geometry resolution if needed
+                                    pm = y_hat["world_points"][:1, sl]
+                                    if t.shape[2:4] != pm.shape[2:4]:
+                                        b_, s_, h_, w_, c_ = t.shape
+                                        t = torch.nn.functional.interpolate(
+                                            t.reshape(b_ * s_, h_, w_, c_).permute(0, 3, 1, 2),
+                                            size=pm.shape[2:4], mode="bilinear", align_corners=False,
+                                        ).permute(0, 2, 3, 1).reshape(b_, s_, pm.shape[2], pm.shape[3], c_)
+                                    return t
+                                rendered_gt = BRDFRenderer(render_downsample=2)(
+                                    albedo=_match(batch["gt_albedo"][:1, sl].float()),
+                                    normal=_match(batch["gt_normal"][:1, sl].float()),
+                                    roughness=_match(batch["gt_roughness"][:1, sl].float()),
+                                    metallic=_match(batch["gt_metallic"][:1, sl].float()),
+                                    sg_params=batch["gt_sg"][:1, sl].float(),
+                                    point_map=y_hat["world_points"][:1, sl].float(),
+                                    camera_pos=cam_pos,
+                                )
+                                save_image(torch.clamp(rendered_gt[0, 0].permute(2, 0, 1), 0., 1.),
+                                           os.path.join(out_dir, "gt_render.png"))
                         except Exception as e:
                             logging.warning(f"[val demo] BRDF render failed: {e}")
 
