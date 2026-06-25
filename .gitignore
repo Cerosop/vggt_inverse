@@ -159,3 +159,5 @@ examples/
 weight/
 
 training/config/*
+
+mipnerf360_*/*
