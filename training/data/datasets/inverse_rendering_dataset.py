@@ -35,9 +35,10 @@ from torch.utils.data import Dataset
 
 
 # Per-pixel env GT shape produced by training/tools/convert_imenvlow.py.
-# (Hs, Ws, env_h, env_w, 3) — must match the converter's --downsample/env grid.
-# Default = OpenRooms imenvlow downsample 2 (120x160 -> 60x80), 8x16 env.
-ENV_PIXEL_SHAPE = (60, 80, 8, 16, 3)
+# (Hs, Ws, env_h, env_w, 3) — must match the converter's --downsample/env grid
+# AND the model's light_spatial_h/w. Default = OpenRooms imenvlow at native
+# resolution (--downsample 1): 120x160 spatial, 8x16 env. (downsample 2 -> 60x80.)
+ENV_PIXEL_SHAPE = (120, 160, 8, 16, 3)
 
 # TEST-ONLY fallback: when env_pixel.npz is not yet populated per-frame, set the
 # env var VGGT_ENV_PIXEL_FALLBACK=/path/to/env_pixel.npz to feed that single file
