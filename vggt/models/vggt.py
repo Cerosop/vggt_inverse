@@ -33,11 +33,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  num_light_samples=2048, num_render_pixels=64,
                  num_material_samples=0,
                  enable_per_pixel_render=False,
+                 per_pixel_render_specular=False,
                  tto_config=None):
         super().__init__()
 
         self.skip_vggt_heads_in_train = skip_vggt_heads_in_train
         self.enable_brdf_render = enable_brdf_render
+        # d4rt per-pixel render: include the SPECULAR term (needs geometry for the
+        # view direction). Independent of enable_brdf_render (the old SG-render flag).
+        self.per_pixel_render_specular = per_pixel_render_specular
         self.brdf_geometry_source = brdf_geometry_source
         self.enable_light_token = enable_light_token
         self.material_decoder = material_decoder   # "dpt" (old) | "d4rt" (new)
@@ -215,7 +219,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # back-propagating into the backbone. Works in both full mode (original tokens)
         # and LoRA mode (LoRA tokens) — VGGT heads are otherwise skipped during training.
         # In "gt" mode the dataset supplies geometry, so this is skipped.
-        if (self.training and self.enable_brdf_render
+        # Triggered by the old SG render (enable_brdf_render) OR the d4rt per-pixel
+        # render's specular term (per_pixel_render_specular) — either needs geometry.
+        if (self.training
+                and (self.enable_brdf_render or getattr(self, "per_pixel_render_specular", False))
                 and getattr(self, "brdf_geometry_source", "pred") == "pred"):
             geom_tokens = lora_tokens_list if lora_tokens_list is not None else aggregated_tokens_list
             if geom_tokens is not None:
