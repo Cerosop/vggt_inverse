@@ -599,6 +599,71 @@ def per_pixel_env_loss(
     return (pred - gt_g)[ve].abs().mean()
 
 
+def per_pixel_render_loss(
+    predictions: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Per-pixel Cook-Torrance render (d4rt per-pixel env) vs the input image.
+
+    At the P pixels the d4rt head emitted full env tiles for (predictions[
+    "render_env"]/"render_uv"), this samples the dense material maps + image
+    (+ geometry for the view dir) at those pixels, renders, and compares to the
+    input RGB (sRGB [0,1]). Couples material + per-pixel lighting (+ normal via
+    the specular term) against image appearance.
+    """
+    if "render_env" not in predictions or "images" not in batch:
+        return None
+    for k in ("render_albedo", "render_normal", "render_roughness", "render_metallic",
+              "render_uv", "render_dir_grid", "render_solid_angle"):
+        if predictions.get(k) is None:
+            return None
+    from vggt.heads.per_pixel_renderer import render_pixels
+
+    env = predictions["render_env"]                  # [B,S,P,Dn,3]
+    uv = predictions["render_uv"]                    # [B,S,P,2] in [0,1]
+    dir_grid = predictions["render_dir_grid"]        # [Dn,3]
+    sa = predictions["render_solid_angle"]           # [Dn]
+    B, S, P, Dn, _ = env.shape
+    BS = B * S
+    images = batch["images"]                         # [B,S,3,H,W] in [0,1] sRGB
+    grid = (uv.reshape(BS, P, 1, 2) * 2 - 1).float()  # [BS,P,1,2]
+
+    def _samp(x, chw=False):
+        """Sample [B,S,H,W,C] (or [B,S,C,H,W] if chw) at uv -> [B,S,P,C]."""
+        if chw:
+            C = x.shape[2]; xc = x.reshape(BS, C, x.shape[3], x.shape[4]).float()
+        else:
+            C = x.shape[-1]; xc = x.reshape(BS, x.shape[2], x.shape[3], C).permute(0, 3, 1, 2).float()
+        s = F.grid_sample(xc, grid, mode="bilinear", align_corners=True, padding_mode="border")
+        return s.squeeze(-1).permute(0, 2, 1).reshape(B, S, P, C)
+
+    target = _samp(images, chw=True)                 # [B,S,P,3]
+    # Material is predicted per-pixel at the SAME render pixels (no map sampling).
+    alb = predictions["render_albedo"]               # [B,S,P,3]
+    nrm = predictions["render_normal"]               # [B,S,P,3]
+    rgh = predictions["render_roughness"]            # [B,S,P,1]
+    met = predictions["render_metallic"]             # [B,S,P,1]
+
+    view = None
+    wp, pe = predictions.get("world_points"), predictions.get("pose_enc")
+    if wp is not None and pe is not None:
+        pos = _samp(wp)                              # [B,S,P,3]
+        cam = pe[..., :3].unsqueeze(2)               # [B,S,1,3]
+        view = F.normalize(cam - pos, dim=-1, eps=1e-8)
+
+    N = B * S * P
+    rendered = render_pixels(
+        alb.reshape(N, 3), nrm.reshape(N, 3), rgh.reshape(N, 1), met.reshape(N, 1),
+        env.reshape(N, Dn, 3), dir_grid, sa,
+        view_dir=view.reshape(N, 3) if view is not None else None,
+    )
+    tgt = target.reshape(N, 3).float()
+    valid = torch.isfinite(rendered).all(-1) & torch.isfinite(tgt).all(-1)
+    if valid.sum() < 1:
+        return (rendered * 0.0).sum()
+    return (rendered - tgt)[valid].abs().mean()
+
+
 def _get_device(d: dict) -> torch.device:
     """Get device from the first tensor in a dict."""
     for v in d.values():

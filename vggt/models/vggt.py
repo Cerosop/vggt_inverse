@@ -30,7 +30,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  material_decoder="dpt", lighting_mode="sg",
                  d4rt_decoder_dim=1024, d4rt_num_layers=8, d4rt_num_heads=16,
                  light_env_h=8, light_env_w=16, light_spatial_h=60, light_spatial_w=80,
-                 num_light_samples=2048,
+                 num_light_samples=2048, num_render_pixels=64,
+                 num_material_samples=0,
+                 enable_per_pixel_render=False,
                  tto_config=None):
         super().__init__()
 
@@ -92,6 +94,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 env_h=light_env_h, env_w=light_env_w,
                 light_spatial_h=light_spatial_h, light_spatial_w=light_spatial_w,
                 num_light_samples=num_light_samples,
+                num_material_samples=num_material_samples,
+                # Render-input (env tile) computation is gated by its own flag, NOT
+                # enable_brdf_render. enable_brdf_render only adds the geometry (point/
+                # camera heads) needed for the SPECULAR term; the diffuse render is
+                # geometry-free, so diffuse-only render keeps the d4rt memory low.
+                enable_render=(lighting_mode == "per_pixel_env" and enable_per_pixel_render),
+                num_render_pixels=num_render_pixels,
+                enable_dynamic_weighting=enable_dynamic_weighting,
             )
 
         # TTO config (used at inference only)

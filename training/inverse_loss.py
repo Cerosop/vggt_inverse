@@ -77,6 +77,13 @@ class InverseRenderingLoss(nn.Module):
     enable_per_pixel_env_loss: bool = False
     weight_per_pixel_env: float = 1.0
 
+    # d4rt per-pixel BRDF render loss: Cook-Torrance render of the predicted env +
+    # material vs the input image, at sampled pixels. Enabled only once training
+    # passes `per_pixel_render_phase` (phase_ratio = epoch / max_epochs).
+    enable_per_pixel_render_loss: bool = False
+    weight_per_pixel_render: float = 1.0
+    per_pixel_render_phase: float = 0.5
+
     # SSIM loss (per-head control via dict)
     ssim: Optional[Dict] = None
 
@@ -245,6 +252,27 @@ class InverseRenderingLoss(nn.Module):
                 # Binarize mask just in case
                 mask = mask > 0.5
 
+            # --- d4rt per-pixel sampled material ---
+            # When the head emits per-pixel samples (material_uv present, pred is
+            # [B,S,N,C]), gather the dense GT at those coords and use a masked L1
+            # (cosine for normal). Dense-only terms (MSG/SSIM/freq/dispersion) need
+            # full 2D maps and are skipped here.
+            if "material_uv" in predictions and pred.ndim == 4:
+                uv = predictions["material_uv"]                  # [B,S,N,2]
+                gt_s = _sample_map_at_uv(gt, uv)                 # [B,S,N,C]
+                mask_s = None
+                if mask is not None:
+                    mask_s = _sample_map_at_uv(mask.unsqueeze(-1).float(), uv).squeeze(-1) > 0.5
+                if head_name == "normal":
+                    valid_gt = (gt_s ** 2).sum(-1) > 1e-3
+                    combined = (mask_s & valid_gt) if mask_s is not None else valid_gt
+                    loss = cosine_similarity_loss(pred, gt_s, combined)
+                else:
+                    loss = masked_l1_loss(pred, gt_s, mask_s)
+                loss_dict[f"loss_inv_{head_name}"] = loss
+                per_head_loss[head_name] = (loss, weight)
+                continue
+
             if head_name == "normal":
                 # Build a valid-normal mask: GT pixels stored as RGB≈127 in [0,1]
                 # decode to XYZ≈0 in [-1,1] — these are invalid and must be excluded.
@@ -324,7 +352,32 @@ class InverseRenderingLoss(nn.Module):
             # Save per-head loss for later weighting
             per_head_loss[head_name] = (loss, weight)
 
-        # --- Combine per-head losses ---
+        # --- d4rt per-pixel env loss (routed through per_head_loss so it can be
+        #     dynamically weighted alongside the material heads) ---
+        if (self.enable_per_pixel_env_loss
+                and "light_pred" in predictions
+                and "gt_env_pixel" in batch):
+            from sg_loss import per_pixel_env_loss
+            env_val = per_pixel_env_loss(
+                predictions["light_pred"],
+                predictions["light_spatial_idx"],
+                predictions["light_dir_idx"],
+                batch["gt_env_pixel"],
+            )
+            loss_dict["loss_per_pixel_env"] = env_val
+            per_head_loss["per_pixel_env"] = (env_val, self.weight_per_pixel_env)
+
+        # --- d4rt per-pixel BRDF render loss (phase-gated; also routed) ---
+        if (self.enable_per_pixel_render_loss
+                and "render_env" in predictions
+                and float(batch.get("phase_ratio", 1.0)) >= self.per_pixel_render_phase):
+            from sg_loss import per_pixel_render_loss
+            r_val = per_pixel_render_loss(predictions, batch)
+            if r_val is not None:
+                loss_dict["loss_per_pixel_render"] = r_val
+                per_head_loss["per_pixel_render"] = (r_val, self.weight_per_pixel_render)
+
+        # --- Combine per-head losses (material + light) ---
         log_var = predictions.get("task_log_var", None)
         task_names = predictions.get("task_log_var_names", None)
         if (self.enable_dynamic_weighting and log_var is not None
@@ -332,7 +385,8 @@ class InverseRenderingLoss(nn.Module):
             # Kendall uncertainty weighting:
             #   L = sum_i [ 0.5 * exp(-s_i) * (static_weight_i * L_i) + 0.5 * s_i ]
             # Static `weight_{name}` is multiplied into L_i so user tuning still
-            # influences scale (the learned s_i then adjusts on top).
+            # influences scale (the learned s_i then adjusts on top). Tasks not in
+            # task_names (no learnable s) fall back to static weighting.
             for head_name, (loss, static_w) in per_head_loss.items():
                 if head_name not in task_names:
                     total_loss = total_loss + loss * static_w
@@ -346,7 +400,7 @@ class InverseRenderingLoss(nn.Module):
             for head_name, (loss, static_w) in per_head_loss.items():
                 total_loss = total_loss + loss * static_w
 
-        # --- Render Loss ---
+        # --- Render Loss (legacy albedo*shading) ---
         if self.enable_render_loss:
             render_val = render_loss(predictions, batch)
             if render_val is not None:
@@ -360,20 +414,6 @@ class InverseRenderingLoss(nn.Module):
             sg_total = sg_loss_dict.get("loss_sg_total", 0)
             if isinstance(sg_total, torch.Tensor):
                 total_loss = total_loss + sg_total
-
-        # --- d4rt per-pixel env loss ---
-        if (self.enable_per_pixel_env_loss
-                and "light_pred" in predictions
-                and "gt_env_pixel" in batch):
-            from sg_loss import per_pixel_env_loss
-            env_val = per_pixel_env_loss(
-                predictions["light_pred"],
-                predictions["light_spatial_idx"],
-                predictions["light_dir_idx"],
-                batch["gt_env_pixel"],
-            )
-            loss_dict["loss_per_pixel_env"] = env_val
-            total_loss = total_loss + env_val * self.weight_per_pixel_env
 
         loss_dict["loss_inv_total"] = total_loss
         return loss_dict
@@ -405,6 +445,34 @@ def masked_mse_loss(
         return diff_sq[mask_expanded].mean()
     else:
         return diff_sq.mean()
+
+
+def masked_l1_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """L1 loss with optional mask. Works for any shape [..., C] with mask [...]."""
+    diff = (pred - gt).abs()
+    if mask is not None:
+        mask_expanded = mask.unsqueeze(-1).expand_as(diff)
+        if mask_expanded.sum() < 1:
+            return (pred * 0.0).sum()
+        return diff[mask_expanded].mean()
+    return diff.mean()
+
+
+def _sample_map_at_uv(x: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+    """Bilinear-sample a dense map [B,S,H,W,C] at uv [B,S,N,2] in [0,1] -> [B,S,N,C].
+
+    Used to gather dense GT material at the d4rt per-pixel sampled coordinates.
+    """
+    B, S, H, W, C = x.shape
+    N = uv.shape[2]
+    xc = x.reshape(B * S, H, W, C).permute(0, 3, 1, 2).float()      # [BS,C,H,W]
+    grid = (uv.reshape(B * S, N, 1, 2) * 2 - 1).float()            # [BS,N,1,2]
+    s = F.grid_sample(xc, grid, mode="bilinear", align_corners=True, padding_mode="border")
+    return s.squeeze(-1).permute(0, 2, 1).reshape(B, S, N, C)
 
 
 def masked_huber_loss(
