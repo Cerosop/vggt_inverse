@@ -589,6 +589,32 @@ class Trainer:
                             except Exception as e:
                                 logging.warning(f"[val demo] gt_env_map save failed: {e}")
 
+                    # --- d4rt per-pixel env demo (lighting_mode="per_pixel_env") ---
+                    # No SG to render; instead visualize the predicted env tile at the
+                    # center spatial pixel (8x16 hemisphere) vs the imenvlow GT tile.
+                    pe = y_hat.get("pred_env_pixel")
+                    if isinstance(pe, torch.Tensor):
+                        try:
+                            def _env_tile_img(tile):  # [env_h, env_w, 3] HDR -> [3,Hh,Ww] LDR
+                                t = tile.float()
+                                t = t / (t + 1.0)                  # Reinhard tone-map
+                                t = t.permute(2, 0, 1).unsqueeze(0)
+                                t = torch.nn.functional.interpolate(
+                                    t, scale_factor=16, mode="nearest")  # upscale for visibility
+                                return torch.clamp(t[0], 0., 1.)
+                            gh, gw = pe.shape[2], pe.shape[3]
+                            ptile = pe[0, img_idx, gh // 2, gw // 2]   # [env_h,env_w,3]
+                            save_image(_env_tile_img(ptile),
+                                       os.path.join(out_dir, "pred_env_pixel.png"))
+                            gep = batch.get("gt_env_pixel")
+                            if isinstance(gep, torch.Tensor) and gep[0, img_idx].abs().sum() > 0:
+                                Hs, Ws = gep.shape[2], gep.shape[3]
+                                gtile = gep[0, img_idx, Hs // 2, Ws // 2]  # [env_h,env_w,3]
+                                save_image(_env_tile_img(gtile),
+                                           os.path.join(out_dir, "gt_env_pixel.png"))
+                        except Exception as e:
+                            logging.warning(f"[val demo] env_pixel save failed: {e}")
+
                     render_keys = ["albedo", "normal", "roughness", "metallic",
                                    "sg_params", "pose_enc", "world_points"]
                     if all(y_hat.get(k) is not None for k in render_keys):

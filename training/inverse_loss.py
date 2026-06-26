@@ -72,6 +72,11 @@ class InverseRenderingLoss(nn.Module):
     # BRDF render geometry source: "pred" (model camera/point heads) or "gt" (dataset).
     brdf_geometry_source: str = "pred"
 
+    # d4rt per-pixel env loss (lighting_mode="per_pixel_env"). Masked log-L1 between
+    # the sampled per-pixel radiance and the imenvlow GT (batch["gt_env_pixel"]).
+    enable_per_pixel_env_loss: bool = False
+    weight_per_pixel_env: float = 1.0
+
     # SSIM loss (per-head control via dict)
     ssim: Optional[Dict] = None
 
@@ -355,6 +360,20 @@ class InverseRenderingLoss(nn.Module):
             sg_total = sg_loss_dict.get("loss_sg_total", 0)
             if isinstance(sg_total, torch.Tensor):
                 total_loss = total_loss + sg_total
+
+        # --- d4rt per-pixel env loss ---
+        if (self.enable_per_pixel_env_loss
+                and "light_pred" in predictions
+                and "gt_env_pixel" in batch):
+            from sg_loss import per_pixel_env_loss
+            env_val = per_pixel_env_loss(
+                predictions["light_pred"],
+                predictions["light_spatial_idx"],
+                predictions["light_dir_idx"],
+                batch["gt_env_pixel"],
+            )
+            loss_dict["loss_per_pixel_env"] = env_val
+            total_loss = total_loss + env_val * self.weight_per_pixel_env
 
         loss_dict["loss_inv_total"] = total_loss
         return loss_dict

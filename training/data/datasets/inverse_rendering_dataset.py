@@ -34,6 +34,40 @@ import numpy as np
 from torch.utils.data import Dataset
 
 
+# Per-pixel env GT shape produced by training/tools/convert_imenvlow.py.
+# (Hs, Ws, env_h, env_w, 3) — must match the converter's --downsample/env grid.
+# Default = OpenRooms imenvlow downsample 2 (120x160 -> 60x80), 8x16 env.
+ENV_PIXEL_SHAPE = (60, 80, 8, 16, 3)
+
+# TEST-ONLY fallback: when env_pixel.npz is not yet populated per-frame, set the
+# env var VGGT_ENV_PIXEL_FALLBACK=/path/to/env_pixel.npz to feed that single file
+# as gt_env_pixel for EVERY frame. Decoded once and (if needed) spatially
+# block-averaged to ENV_PIXEL_SHAPE. Leave the env var unset for normal training.
+_ENV_PIXEL_FALLBACK_CACHE = {}
+
+
+def _load_env_pixel_fallback():
+    """Return the cached fallback env tile (ENV_PIXEL_SHAPE) or None if unset."""
+    path = os.environ.get("VGGT_ENV_PIXEL_FALLBACK", "")
+    if not path:
+        return None
+    if path in _ENV_PIXEL_FALLBACK_CACHE:
+        return _ENV_PIXEL_FALLBACK_CACHE[path]
+    with np.load(path, allow_pickle=False) as _d:
+        ep = _d["env"].astype(np.float32)
+        if "log1p" in _d and bool(_d["log1p"]):
+            ep = np.expm1(ep)
+    # Block-average the spatial dims to ENV_PIXEL_SHAPE if they differ by an int factor.
+    Hs, Ws = ep.shape[:2]
+    tH, tW = ENV_PIXEL_SHAPE[:2]
+    if (Hs, Ws) != (tH, tW) and Hs % tH == 0 and Ws % tW == 0:
+        fh, fw = Hs // tH, Ws // tW
+        ep = ep.reshape(tH, fh, tW, fw, *ep.shape[2:]).mean(axis=(1, 3))
+    ep = np.ascontiguousarray(ep.astype(np.float32))
+    logging.warning(f"[env_pixel] using FALLBACK {path} for all frames; shape {ep.shape}")
+    _ENV_PIXEL_FALLBACK_CACHE[path] = ep
+    return ep
+
 # Maps: GT filename -> (batch_key, num_channels)
 GT_FILES = {
     "albedo.png":    ("gt_albedo", 3),
@@ -49,6 +83,7 @@ OPTIONAL_GT_FILES = {
     "sg.npy":       ("gt_sg", -1),           # SG GT: per-scene [num_lobes, 7]
     "env_map.npy":  ("gt_env_map", 3),       # Per-frame environment map for SG-vs-env supervision
     "diffuse_illumination.npy": ("gt_diffuse_illumination", 3),  # Hypersim per-frame diffuse irradiance
+    "env_pixel.npz": ("gt_env_pixel", -1),   # Per-pixel env GT (Hs,Ws,8,16,3) for the d4rt lighting branch
 }
 
 
@@ -263,6 +298,25 @@ class InverseRenderingDataset(Dataset):
                         gt_data[gt_file].append(di)
                     else:
                         gt_data[gt_file].append(np.zeros((target_h, target_w, 3), dtype=np.float32))
+                    continue
+
+                # env_pixel.npz: per-pixel env GT (Hs,Ws,8,16,3), fp16 [+ log1p].
+                if gt_file == "env_pixel.npz":
+                    fallback = _load_env_pixel_fallback()
+                    if fallback is not None:
+                        gt_data[gt_file].append(fallback)
+                        continue
+                    ep_path = osp.join(frame_dir, gt_file)
+                    if gt_file in scene["available_gts"] and osp.exists(ep_path):
+                        with np.load(ep_path, allow_pickle=False) as _d:
+                            ep = _d["env"].astype(np.float32)
+                            if "log1p" in _d and bool(_d["log1p"]):
+                                ep = np.expm1(ep)
+                        if ep.shape != ENV_PIXEL_SHAPE:
+                            ep = np.zeros(ENV_PIXEL_SHAPE, dtype=np.float32)  # shape mismatch -> skip
+                    else:
+                        ep = np.zeros(ENV_PIXEL_SHAPE, dtype=np.float32)
+                    gt_data[gt_file].append(ep)
                     continue
 
                 if gt_file in scene["available_gts"]:

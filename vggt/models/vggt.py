@@ -27,6 +27,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  resnext_pretrained=True,
                  resnext_disable_layer34=False,
                  enable_dynamic_weighting=False,
+                 material_decoder="dpt", lighting_mode="sg",
+                 d4rt_decoder_dim=1024, d4rt_num_layers=8, d4rt_num_heads=16,
+                 light_env_h=8, light_env_w=16, light_spatial_h=60, light_spatial_w=80,
+                 num_light_samples=2048,
                  tto_config=None):
         super().__init__()
 
@@ -34,6 +38,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.enable_brdf_render = enable_brdf_render
         self.brdf_geometry_source = brdf_geometry_source
         self.enable_light_token = enable_light_token
+        self.material_decoder = material_decoder   # "dpt" (old) | "d4rt" (new)
+        self.lighting_mode = lighting_mode         # "sg" (old) | "per_pixel_env" (new)
 
         self.aggregator = Aggregator(
             img_size=img_size, patch_size=patch_size, embed_dim=embed_dim,
@@ -49,8 +55,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
         # Inverse rendering heads (NEW)
+        # Built only when at least one branch still uses the old path
+        # (DPT materials or SG lighting). In pure-d4rt mode both branches are
+        # handled by d4rt_heads, so this (incl. its ResNeXt encoder) is skipped.
         self.inverse_heads = None
-        if enable_inverse:
+        if enable_inverse and (material_decoder == "dpt" or lighting_mode == "sg"):
             from vggt.heads.inverse_heads import InverseHeads
             self.inverse_heads = InverseHeads(
                 dim_in=2 * embed_dim,
@@ -65,6 +74,24 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 resnext_pretrained=resnext_pretrained,
                 resnext_disable_layer34=resnext_disable_layer34,
                 enable_dynamic_weighting=enable_dynamic_weighting,
+            )
+
+        # d4rt cross-attention inverse heads (NEW, switchable). Built only when a
+        # branch is set to "d4rt"/"per_pixel_env"; the old path above is untouched.
+        self.d4rt_heads = None
+        if enable_inverse and (material_decoder == "d4rt" or lighting_mode == "per_pixel_env"):
+            from vggt.heads.d4rt_inverse_heads import D4RTInverseHeads
+            self.d4rt_heads = D4RTInverseHeads(
+                dim_in=2 * embed_dim,
+                decoder_dim=d4rt_decoder_dim,
+                num_layers=d4rt_num_layers,
+                num_heads=d4rt_num_heads,
+                patch_size=patch_size,
+                enable_material=(material_decoder == "d4rt"),
+                enable_lighting=(lighting_mode == "per_pixel_env"),
+                env_h=light_env_h, env_w=light_env_w,
+                light_spatial_h=light_spatial_h, light_spatial_w=light_spatial_w,
+                num_light_samples=num_light_samples,
             )
 
         # TTO config (used at inference only)
@@ -194,16 +221,21 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                             )
                             predictions["world_points"] = pts3d
 
-        # --- Inverse rendering heads (NEW, trainable) ---
-        if self.inverse_heads is not None:
-            # Use LoRA tokens if available, otherwise original tokens
-            tokens_for_inverse = lora_tokens_list if lora_tokens_list is not None else aggregated_tokens_list
-            # Determine which heads to run based on available GTs (passed via images_meta)
+        # --- Inverse rendering heads ---
+        tokens_for_inverse = lora_tokens_list if lora_tokens_list is not None else aggregated_tokens_list
+        # Old DPT/SG path: run when materials use "dpt" OR lighting uses "sg".
+        if self.inverse_heads is not None and (self.material_decoder == "dpt" or self.lighting_mode == "sg"):
             inverse_preds = self.inverse_heads(
                 tokens_for_inverse, images, patch_start_idx,
                 light_token=light_token_out,
             )
-            predictions.update(inverse_preds)
+            if self.material_decoder == "dpt":
+                predictions.update(inverse_preds)        # materials (+ sg if any)
+            elif "sg_params" in inverse_preds:
+                predictions["sg_params"] = inverse_preds["sg_params"]  # keep only sg
+        # New d4rt path: material (d4rt) and/or lighting (per_pixel_env).
+        if self.d4rt_heads is not None:
+            predictions.update(self.d4rt_heads(tokens_for_inverse, images, patch_start_idx))
 
         if not self.training:
             predictions["images"] = images

@@ -548,6 +548,57 @@ def render_env_map_from_sg(sg_params, height=64, width=128):
     return radiance
 
 
+def per_pixel_env_loss(
+    light_pred: torch.Tensor,
+    spatial_idx: torch.Tensor,
+    dir_idx: torch.Tensor,
+    gt_env_pixel: torch.Tensor,
+    log_space: bool = True,
+) -> torch.Tensor:
+    """Masked log-L1 between the d4rt per-pixel radiance and the imenvlow GT.
+
+    The d4rt lighting branch predicts radiance for randomly sampled (pixel, direction)
+    pairs. This gathers the matching GT samples from the dense per-pixel env tile and
+    compares them in sign-preserving log space (HDR radiance spans many orders).
+
+    Args:
+        light_pred:   [B, S, M, 3] predicted radiance (>= 0, softplus).
+        spatial_idx:  [B, S, M] flattened spatial index into Hs*Ws.
+        dir_idx:      [B, S, M] flattened direction index into env_h*env_w.
+        gt_env_pixel: [B, S, Hs, Ws, env_h, env_w, 3] HDR per-pixel env GT. Frames
+                      without GT are all-zero placeholders and are excluded per (b, s).
+        log_space:    compare log1p(radiance) instead of raw radiance.
+
+    Returns:
+        Scalar loss (0 when no valid samples are present).
+    """
+    B, S, M = spatial_idx.shape
+    Hs, Ws, eh, ew = gt_env_pixel.shape[2:6]
+    SP, DN = Hs * Ws, eh * ew
+
+    # Gather the GT radiance for each sampled (spatial, direction) pair.
+    gt_flat = gt_env_pixel.reshape(B, S, SP * DN, 3).float()          # [B,S,SP*DN,3]
+    comb_idx = (spatial_idx * DN + dir_idx).clamp(0, SP * DN - 1)     # [B,S,M]
+    idx = comb_idx.unsqueeze(-1).expand(B, S, M, 3)
+    gt_g = torch.gather(gt_flat, 2, idx)                             # [B,S,M,3]
+
+    # Valid = frame actually has env GT (placeholders are all-zero) AND sample finite.
+    has_env = gt_env_pixel.reshape(B, S, -1).abs().sum(-1) > 0        # [B,S]
+    finite = torch.isfinite(gt_g).all(dim=-1)                        # [B,S,M]
+    valid = has_env.unsqueeze(-1) & finite                          # [B,S,M]
+
+    pred = light_pred.float().clamp(min=0.0)
+    gt_g = torch.nan_to_num(gt_g, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+    if log_space:
+        pred = torch.log1p(pred)
+        gt_g = torch.log1p(gt_g)
+
+    ve = valid.unsqueeze(-1).expand_as(pred)
+    if ve.sum() < 1:
+        return (pred * 0.0).sum()
+    return (pred - gt_g)[ve].abs().mean()
+
+
 def _get_device(d: dict) -> torch.device:
     """Get device from the first tensor in a dict."""
     for v in d.values():
