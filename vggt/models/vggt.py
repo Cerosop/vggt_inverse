@@ -34,6 +34,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  num_material_samples=0,
                  enable_per_pixel_render=False,
                  per_pixel_render_specular=False,
+                 d4rt_cross_frame=False,
+                 d4rt_render_demo_upsample=4,
                  tto_config=None):
         super().__init__()
 
@@ -105,7 +107,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 # geometry-free, so diffuse-only render keeps the d4rt memory low.
                 enable_render=(lighting_mode == "per_pixel_env" and enable_per_pixel_render),
                 num_render_pixels=num_render_pixels,
+                render_demo_upsample=d4rt_render_demo_upsample,
                 enable_dynamic_weighting=enable_dynamic_weighting,
+                cross_frame=d4rt_cross_frame,
             )
 
         # TTO config (used at inference only)

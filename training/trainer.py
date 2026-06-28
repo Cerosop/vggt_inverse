@@ -539,9 +539,35 @@ class Trainer:
                 if img.shape[-1] == 3: img = img.permute(2, 0, 1)
                 save_image(torch.clamp(img, 0., 1.), os.path.join(out_dir, "input.png"))
 
+                # d4rt: re-run the frozen backbone on just the demo frame ONCE; shared by
+                # the full material maps + the render preview below. (_tk/_psi/_di or None.)
+                _m = self.model.module if hasattr(self.model, "module") else self.model
+                _d4rt = getattr(_m, "d4rt_heads", None)
+                _tk = _psi = _di = None
+                if _d4rt is not None and _d4rt.enable_material and "material_uv" in y_hat:
+                    try:
+                        with torch.no_grad():
+                            _di = batch["images"][:1, img_idx:img_idx + 1]   # [1,1,3,H,W]
+                            _agg, _lora, _psi, _ = _m.aggregator(_di)
+                            _tk = _lora if _lora is not None else _agg
+                    except Exception as e:
+                        logging.warning(f"[val demo] backbone re-run failed: {e}")
+                        _tk = None
+
+                mat_full = None      # full per-pixel material maps for the demo frame ([1,1,H,W,c])
+                if _tk is not None:
+                    try:
+                        mat_full = _d4rt.predict_material_dense(_tk, _di, _psi)
+                    except Exception as e:
+                        logging.warning(f"[val demo] dense material query failed: {e}")
+
                 for head in ["albedo", "metallic", "roughness", "normal", "shading"]:
-                    if head in y_hat:
+                    pred_t = None
+                    if mat_full is not None and head in mat_full:
+                        pred_t = mat_full[head][0, 0].clone()          # [H,W,c]
+                    elif "material_uv" not in y_hat and head in y_hat:  # dense path (num_material_samples=0)
                         pred_t = y_hat[head][0, img_idx].clone()
+                    if pred_t is not None:
                         if pred_t.dim() == 4: pred_t = pred_t.squeeze(0)
                         if pred_t.shape[-1] in [1, 3]: pred_t = pred_t.permute(2, 0, 1)
                         if pred_t.shape[0] == 1: pred_t = pred_t.repeat(3, 1, 1)
@@ -556,6 +582,25 @@ class Trainer:
                         if gt_t.shape[0] == 1: gt_t = gt_t.repeat(3, 1, 1)
                         if head == "normal" and gt_t.shape[0] == 3: gt_t = (gt_t + 1.0) / 2.0
                         save_image(torch.clamp(gt_t, 0.0, 1.0), os.path.join(out_dir, f"gt_{head}.png"))
+
+                # --- d4rt render preview (ALWAYS, regardless of render-loss flag) ---
+                # Smart full-res render: full-res material (reuse mat_full) × lighting on a
+                # (H/f, W/f) coarse grid upsampled by f (render_demo_upsample). sRGB, full res.
+                if _tk is not None and _d4rt.enable_lighting and mat_full is not None:
+                    try:
+                        with torch.no_grad():
+                            pm = cam = None
+                            if getattr(_m, "per_pixel_render_specular", False) and _m.point_head is not None:
+                                from vggt.heads.brdf_renderer import compute_camera_positions
+                                _pose = _m.camera_head(_tk)
+                                cam = compute_camera_positions(_pose[-1])
+                                pm, _ = _m.point_head(_tk, images=_di, patch_start_idx=_psi)
+                            rendered = _d4rt.render_demo(_tk, _di, _psi, material=mat_full,
+                                                         point_map=pm, camera_pos=cam)  # [1,1,H,W,3]
+                            rimg = rendered[0, 0].permute(2, 0, 1)                      # [3,H,W] full res
+                            save_image(torch.clamp(rimg, 0., 1.), os.path.join(out_dir, "pred_render.png"))
+                    except Exception as e:
+                        logging.warning(f"[val demo] render preview failed: {e}")
 
                 # --- Light token demos: SG environment map + BRDF-rendered image ---
                 # SG params are hard to visualize directly, so we render the SG lobes

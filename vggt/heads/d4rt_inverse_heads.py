@@ -53,7 +53,10 @@ class D4RTInverseHeads(nn.Module):
         num_material_samples: int = 0,   # 0 = dense grid+upsample (old); >0 = per-pixel sampled
         enable_render: bool = False,
         num_render_pixels: int = 64,
+        render_demo_upsample: int = 4,    # demo render: 1 lighting sample per f×f block, upsample f
         enable_dynamic_weighting: bool = False,
+        cross_frame: bool = False,        # True = each query attends to ALL frames (d4rt-style)
+        max_frames: int = 32,
         frames_chunk_size: int = 8,   # accepted for API parity (unused here)
     ):
         super().__init__()
@@ -66,9 +69,19 @@ class D4RTInverseHeads(nn.Module):
         self.num_material_samples = num_material_samples
         self.enable_render = enable_render
         self.num_render_pixels = num_render_pixels
+        self.render_demo_upsample = render_demo_upsample
+        self.cross_frame = cross_frame
+        self._npatch = None               # set in _build_memory (for frame-id recovery)
         self.head_names = ["albedo", "metallic", "roughness", "normal", "shading"]
 
-        self.mem_proj = nn.Linear(dim_in, decoder_dim)
+        # Memory projection. Match d4rt: Identity when no dim change (no resolution loss),
+        # a Linear only if decoder_dim != backbone dim. Set decoder_dim == dim_in (2048)
+        # to keep the full backbone features (no reduction).
+        self.mem_proj = nn.Identity() if decoder_dim == dim_in else nn.Linear(dim_in, decoder_dim)
+        # Frame embedding for cross-frame attention (added to memory tokens by their frame
+        # id AND to each query by its target frame, so a query can tell its own frame from
+        # the others while still attending across all frames — like d4rt's t_src/t_tgt).
+        self.frame_embed = nn.Embedding(max_frames, decoder_dim) if cross_frame else None
 
         if enable_material:
             self.mat_query = QueryEmbedder(decoder_dim, use_direction=False,
@@ -119,8 +132,28 @@ class D4RTInverseHeads(nn.Module):
         B, S, P, C = x.shape
         patch = x[:, :, patch_start_idx:, :]      # [B,S,Npatch,2048]
         Npatch = patch.shape[2]
-        mem = self.mem_proj(patch).reshape(B * S, Npatch, -1)   # [B*S, Npatch, D]
+        self._npatch = Npatch                     # remember for query frame-id recovery
+        mem = self.mem_proj(patch)                # [B,S,Npatch,D]
+        D = mem.shape[-1]
+        if self.cross_frame:
+            # tag each token with its frame id, then make EVERY query (of a scene) attend
+            # to ALL frames of that scene: mem -> [B*S, S*Npatch, D] (replicated per frame).
+            fe = self.frame_embed(torch.arange(S, device=mem.device))   # [S, D]
+            mem = mem + fe[None, :, None, :]
+            mem = mem.reshape(B, S * Npatch, D)
+            mem = mem[:, None].expand(B, S, S * Npatch, D).reshape(B * S, S * Npatch, D)
+        else:
+            mem = mem.reshape(B * S, Npatch, D)   # [B*S, Npatch, D]
         return mem, B, S, Npatch
+
+    def _add_query_frame_embed(self, q, mem):
+        """Add each query's own-frame embedding (cross-frame mode). q:[B*S,M,D]."""
+        if not self.cross_frame or self.frame_embed is None or self._npatch is None:
+            return q
+        BS = q.shape[0]
+        S = max(1, mem.shape[1] // self._npatch)
+        fid = torch.arange(BS, device=q.device) % S    # frame id of each batch element
+        return q + self.frame_embed(fid)[:, None, :]
 
     @staticmethod
     def _apply_material_activation(name, x):
@@ -136,6 +169,7 @@ class D4RTInverseHeads(nn.Module):
         dense grid and random per-pixel sampling.
         """
         q = self.mat_query(u, v, image=images_bs)                # [BS,M,D]
+        q = self._add_query_frame_embed(q, mem)
         z = self.mat_trunk(self.mat_decoder(q, mem))             # [BS,M,D]
         return {name: self.mat_heads[name](z) for name in self.head_names}
 
@@ -181,6 +215,7 @@ class D4RTInverseHeads(nn.Module):
     def _light_radiance(self, mem, u, v, direction):
         """mem:[B*S,N,D]; u,v:[B*S,M]; direction:[B*S,M,3] -> radiance [B*S,M,3] (softplus)."""
         q = self.light_query(u, v, direction=direction)
+        q = self._add_query_frame_embed(q, mem)
         z = self.light_decoder(q, mem)
         return F.softplus(self.light_head(z))
 
@@ -245,6 +280,104 @@ class D4RTInverseHeads(nn.Module):
         return env.reshape(B, S, P, -1, 3), uv.reshape(B, S, P, 2), mat
 
     @torch.no_grad()
+    def predict_material_dense(self, tokens_list, images, patch_start_idx, chunk=16384):
+        """Full per-pixel material maps for demo / inference -> dict name->[B,S,H,W,c].
+
+        Queries EVERY pixel (chunked) so the maps show the true per-pixel detail the
+        model was trained for (vs the patch-grid+bilinear `_material_dense`).
+        """
+        B, S, _, H, W = images.shape
+        mem, _, _, _ = self._build_memory(tokens_list, patch_start_idx)
+        images_bs = images.reshape(B * S, 3, H, W)
+        dev = mem.device
+        us = (torch.arange(W, device=dev).float() + 0.5) / W
+        vs = (torch.arange(H, device=dev).float() + 0.5) / H
+        vv, uu = torch.meshgrid(vs, us, indexing="ij")
+        u_all = uu.reshape(1, -1).expand(B * S, -1)      # [BS, H*W]
+        v_all = vv.reshape(1, -1).expand(B * S, -1)
+        HW = H * W
+        acc = {name: [] for name in self.head_names}
+        for s in range(0, HW, chunk):
+            e = min(s + chunk, HW)
+            raw = self._material_features(mem, images_bs, u_all[:, s:e], v_all[:, s:e])
+            for name, r in raw.items():
+                acc[name].append(self._apply_material_activation(name, r))
+        out = {}
+        for name in self.head_names:
+            cat = torch.cat(acc[name], dim=1)            # [BS, HW, c]
+            out[name] = cat.reshape(B, S, H, W, cat.shape[-1])
+        return out
+
+    @torch.no_grad()
+    def render_demo(self, tokens_list, images, patch_start_idx, material=None,
+                    point_map=None, camera_pos=None):
+        """Smart full-res render: full-res material × lighting computed on a coarse
+        (H/f, W/f) grid then upsampled by f = self.render_demo_upsample.
+
+        Diffuse = full-res albedo·(1-m)/π × upsample(coarse irradiance)  → material-sharp.
+        Specular (if point_map/camera_pos given) is evaluated on the coarse grid and
+        upsampled (lighting is low-freq, so this is cheap and visually fine).
+        `material`: optional precomputed full-res maps {name:[B,S,H,W,c]} (else queried).
+        Returns sRGB [B,S,H,W,3].
+        """
+        from vggt.heads.per_pixel_renderer import render_pixels
+        B, S, _, H, W = images.shape
+        mem, _, _, _ = self._build_memory(tokens_list, patch_start_idx)
+        BS = B * S
+        f = max(1, int(self.render_demo_upsample))
+        Hl, Wl = max(1, H // f), max(1, W // f)        # coarse lighting grid
+        dev = mem.device
+
+        # full-res material (reuse precomputed maps if given)
+        if material is not None:
+            mat = {n: material[n].reshape(BS, H, W, -1) for n in self.head_names if n in material}
+        else:
+            md = self.predict_material_dense(tokens_list, images, patch_start_idx)
+            mat = {n: md[n].reshape(BS, H, W, -1) for n in self.head_names}
+        alb, nrm, rgh, met = mat["albedo"], mat["normal"], mat["roughness"], mat["metallic"]  # [BS,H,W,c]
+
+        # coarse lighting grid uv
+        sh = (torch.arange(Hl, device=dev).float() + 0.5) / Hl
+        sw = (torch.arange(Wl, device=dev).float() + 0.5) / Wl
+        vv, uu = torch.meshgrid(sh, sw, indexing="ij")
+        u = uu.reshape(1, -1).expand(BS, -1)           # [BS, Hl*Wl]
+        v = vv.reshape(1, -1).expand(BS, -1)
+        env = self._light_env_tiles(mem, u, v, chunk=16384)   # [BS, Hl*Wl, Dn, 3]
+        Dn = env.shape[2]
+
+        # diffuse irradiance (material-free) -> upsample to full res
+        wgt = (self.dir_grid[:, 1].clamp(min=0.0) * self.solid_angle)[None, None, :, None]  # [1,1,Dn,1]
+        E = (env * wgt).sum(dim=2).reshape(BS, Hl, Wl, 3).permute(0, 3, 1, 2)               # [BS,3,Hl,Wl]
+        E = F.interpolate(E, size=(H, W), mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
+        rendered = alb * (1.0 - met) / math.pi * E     # [BS,H,W,3] full-res material × upsampled light
+
+        # specular: evaluate coarse (coarse material + view), upsample, add
+        if point_map is not None and camera_pos is not None:
+            def _coarse(x):
+                xc = F.adaptive_avg_pool2d(x.permute(0, 3, 1, 2).float(), (Hl, Wl))
+                return xc.permute(0, 2, 3, 1).reshape(BS, Hl * Wl, -1)
+            alb_c = _coarse(alb); nrm_c = F.normalize(_coarse(nrm), dim=-1, eps=1e-8)
+            rgh_c = _coarse(rgh); met_c = _coarse(met)
+            pm = point_map.reshape(BS, point_map.shape[2], point_map.shape[3], 3).permute(0, 3, 1, 2).float()
+            grid = (torch.stack([u, v], -1).reshape(BS, Hl * Wl, 1, 2) * 2 - 1).float()
+            pos = F.grid_sample(pm, grid, mode="bilinear", align_corners=True,
+                                padding_mode="border").squeeze(-1).permute(0, 2, 1)
+            cam = camera_pos.reshape(BS, 3)[:, None, :]
+            view = F.normalize(cam - pos, dim=-1, eps=1e-8)
+            Nc = BS * Hl * Wl
+            _, spec = render_pixels(
+                alb_c.reshape(Nc, 3), nrm_c.reshape(Nc, 3), rgh_c.reshape(Nc, 1), met_c.reshape(Nc, 1),
+                env.reshape(Nc, Dn, 3), self.dir_grid, self.solid_angle,
+                view_dir=view.reshape(Nc, 3), return_parts=True)
+            spec = spec.reshape(BS, Hl, Wl, 3).permute(0, 3, 1, 2)
+            spec = F.interpolate(spec, size=(H, W), mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
+            rendered = rendered + spec
+
+        rendered = rendered / (rendered + 1.0)
+        rendered = rendered.clamp(min=1e-5).pow(1.0 / 2.2)
+        return rendered.reshape(B, S, H, W, 3)
+
+    @torch.no_grad()
     def predict_env_dense(self, tokens_list, patch_start_idx, spatial_h=None, spatial_w=None):
         """Inference: full per-pixel env [B,S,Hs,Ws,env_h,env_w,3] at a spatial grid."""
         mem, B, S, _ = self._build_memory(tokens_list, patch_start_idx)
@@ -272,13 +405,15 @@ class D4RTInverseHeads(nn.Module):
         preds: Dict[str, torch.Tensor] = {}
 
         if self.enable_material:
-            if self.training and self.num_material_samples > 0:
-                # d4rt-style: predict material at random per-pixel coords (1x1).
+            if self.num_material_samples > 0:
+                # d4rt-style per-pixel: random pixel coords at BOTH train and eval, so
+                # the val loss stays per-pixel + cheap (no dense 37x37 grid). Full dense
+                # maps for the demo / inference come from predict_material_dense().
                 mat, muv = self._material_sampled(mem, images_bs, B, S)
                 preds.update(mat)                  # name -> [B,S,N,c]
                 preds["material_uv"] = muv         # [B,S,N,2]
             else:
-                # eval / old path: dense maps for the demo + dense loss.
+                # num_material_samples=0: dense patch-grid + bilinear upsample (old path).
                 preds.update(self._material_dense(mem, images_bs, B, S))
 
         if self.enable_lighting:

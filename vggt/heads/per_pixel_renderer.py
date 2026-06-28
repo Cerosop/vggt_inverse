@@ -67,8 +67,10 @@ def render_pixels(
     solid_angle: torch.Tensor, # [D]
     view_dir: torch.Tensor = None,  # [N, 3] world view dir (cam - pos), unit; None -> diffuse only
     tonemap_gamma: bool = True,
+    return_parts: bool = False,     # if True, return (diffuse, specular) LINEAR (pre-tonemap)
 ) -> torch.Tensor:
-    """Cook-Torrance render of N pixels from their per-pixel env. Returns [N, 3]."""
+    """Cook-Torrance render of N pixels from their per-pixel env. Returns [N, 3]
+    (or (diffuse[N,3], specular[N,3]) linear if return_parts)."""
     N = albedo.shape[0]
     D = dir_grid.shape[0]
     dg = dir_grid.to(albedo.dtype)
@@ -81,7 +83,7 @@ def render_pixels(
     irradiance = (env * w).sum(dim=1)                  # [N,3]  sum_i L * cos * dOmega
     diffuse = diffuse_albedo / math.pi * irradiance    # [N,3]
 
-    rendered = diffuse
+    specular = torch.zeros_like(diffuse)
 
     # --- Specular (needs view dir in the local frame) ---
     if view_dir is not None:
@@ -114,8 +116,11 @@ def render_pixels(
         denom = 4.0 * ndotl * ndotv + 1e-8             # [N,D,1]
         spec_brdf = Dggx * G * Fr / denom              # [N,D,3]
         specular = (spec_brdf * env * w).sum(dim=1)    # [N,3]
-        rendered = rendered + specular
 
+    if return_parts:
+        return diffuse, specular                       # linear, pre-tonemap
+
+    rendered = diffuse + specular
     if tonemap_gamma:
         rendered = rendered / (rendered + 1.0)                 # Reinhard -> [0,1)
         rendered = rendered.clamp(min=1e-5).pow(1.0 / 2.2)     # sRGB gamma (match brdf_renderer)
