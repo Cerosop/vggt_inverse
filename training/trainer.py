@@ -527,7 +527,7 @@ class Trainer:
                         batch, self.model, phase, loss_meters
                     )
             
-            if data_iter < 3 and self.rank == 0:
+            if data_iter < getattr(self.logging_conf, "num_demo_scenes", 3) and self.rank == 0:
                 import os
                 from torchvision.utils import save_image
                 out_dir = os.path.join(self.checkpoint_conf.save_dir, "val_outputs", f"epoch_{self.epoch + 1}", f"scene_{data_iter}")

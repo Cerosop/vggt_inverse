@@ -36,6 +36,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  per_pixel_render_specular=False,
                  d4rt_cross_frame=False,
                  d4rt_render_demo_upsample=4,
+                 d4rt_grad_checkpoint=False,
                  tto_config=None):
         super().__init__()
 
@@ -110,6 +111,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 render_demo_upsample=d4rt_render_demo_upsample,
                 enable_dynamic_weighting=enable_dynamic_weighting,
                 cross_frame=d4rt_cross_frame,
+                grad_checkpoint=d4rt_grad_checkpoint,
             )
 
         # TTO config (used at inference only)

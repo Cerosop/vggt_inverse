@@ -57,6 +57,7 @@ class D4RTInverseHeads(nn.Module):
         enable_dynamic_weighting: bool = False,
         cross_frame: bool = False,        # True = each query attends to ALL frames (d4rt-style)
         max_frames: int = 32,
+        grad_checkpoint: bool = False,    # gradient-checkpoint material/light decoders (mem↓, ~+30% time)
         frames_chunk_size: int = 8,   # accepted for API parity (unused here)
     ):
         super().__init__()
@@ -71,6 +72,7 @@ class D4RTInverseHeads(nn.Module):
         self.num_render_pixels = num_render_pixels
         self.render_demo_upsample = render_demo_upsample
         self.cross_frame = cross_frame
+        self.grad_checkpoint = grad_checkpoint
         self._npatch = None               # set in _build_memory (for frame-id recovery)
         self.head_names = ["albedo", "metallic", "roughness", "normal", "shading"]
 
@@ -170,7 +172,11 @@ class D4RTInverseHeads(nn.Module):
         """
         q = self.mat_query(u, v, image=images_bs)                # [BS,M,D]
         q = self._add_query_frame_embed(q, mem)
-        z = self.mat_trunk(self.mat_decoder(q, mem))             # [BS,M,D]
+        if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+            dec = checkpoint(self.mat_decoder, q, mem, use_reentrant=False)
+        else:
+            dec = self.mat_decoder(q, mem)
+        z = self.mat_trunk(dec)                                  # [BS,M,D]
         return {name: self.mat_heads[name](z) for name in self.head_names}
 
     def _material_dense(self, mem, images_bs, B, S):
@@ -212,11 +218,18 @@ class D4RTInverseHeads(nn.Module):
         return {name: self._apply_material_activation(name, r).reshape(B, S, u.shape[1], -1)
                 for name, r in raw.items()}
 
-    def _light_radiance(self, mem, u, v, direction):
-        """mem:[B*S,N,D]; u,v:[B*S,M]; direction:[B*S,M,3] -> radiance [B*S,M,3] (softplus)."""
+    def _light_radiance(self, mem, u, v, direction, ckpt=False):
+        """mem:[B*S,N,D]; u,v:[B*S,M]; direction:[B*S,M,3] -> radiance [B*S,M,3] (softplus).
+
+        ckpt: gradient-checkpoint the light decoder (env-loss path). The render path
+        (_light_env_tiles) already wraps this whole fn in checkpoint, so it passes ckpt=False.
+        """
         q = self.light_query(u, v, direction=direction)
         q = self._add_query_frame_embed(q, mem)
-        z = self.light_decoder(q, mem)
+        if ckpt and self.training and torch.is_grad_enabled():
+            z = checkpoint(self.light_decoder, q, mem, use_reentrant=False)
+        else:
+            z = self.light_decoder(q, mem)
         return F.softplus(self.light_head(z))
 
     def _light_branch_sampled(self, mem, B, S):
@@ -231,7 +244,7 @@ class D4RTInverseHeads(nn.Module):
         sh = (spatial_idx // Ws).float(); sw = (spatial_idx % Ws).float()
         u = (sw + 0.5) / Ws; v = (sh + 0.5) / Hs                       # [BS,M]
         direction = self.dir_grid[dir_idx]                             # [BS,M,3]
-        rad = self._light_radiance(mem, u, v, direction)              # [BS,M,3]
+        rad = self._light_radiance(mem, u, v, direction, ckpt=self.grad_checkpoint)  # [BS,M,3]
         return (rad.reshape(B, S, M, 3),
                 spatial_idx.reshape(B, S, M),
                 dir_idx.reshape(B, S, M))
