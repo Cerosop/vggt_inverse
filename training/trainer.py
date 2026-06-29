@@ -589,14 +589,18 @@ class Trainer:
                 if _tk is not None and _d4rt.enable_lighting and mat_full is not None:
                     try:
                         with torch.no_grad():
-                            pm = cam = None
+                            pm = cam = crot = None
                             if getattr(_m, "per_pixel_render_specular", False) and _m.point_head is not None:
                                 from vggt.heads.brdf_renderer import compute_camera_positions
+                                from vggt.utils.rotation import quat_to_mat
                                 _pose = _m.camera_head(_tk)
                                 cam = compute_camera_positions(_pose[-1])
+                                _R = quat_to_mat(_pose[-1][..., 3:7])     # world->OpenCV cam
+                                _C = _R.new_tensor([[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]])
+                                crot = torch.einsum('ij,bsjk->bsik', _C, _R)  # world->OpenRooms y-up cam
                                 pm, _ = _m.point_head(_tk, images=_di, patch_start_idx=_psi)
                             rendered = _d4rt.render_demo(_tk, _di, _psi, material=mat_full,
-                                                         point_map=pm, camera_pos=cam)  # [1,1,H,W,3]
+                                                         point_map=pm, camera_pos=cam, cam_rot=crot)  # [1,1,H,W,3]
                             rimg = rendered[0, 0].permute(2, 0, 1)                      # [3,H,W] full res
                             save_image(torch.clamp(rimg, 0., 1.), os.path.join(out_dir, "pred_render.png"))
                     except Exception as e:

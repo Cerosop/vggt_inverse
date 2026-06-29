@@ -250,9 +250,12 @@ def smith_geometry(ndotl: torch.Tensor, ndotv: torch.Tensor, alpha: torch.Tensor
 
     G(n,v,l) = G1(n,v) * G1(n,l)
     G1(n,x) = n·x / (n·x * (1 - k) + k)
-    k = α² / 2 (for analytic lights; for IBL k = (α+1)² / 8)
 
-    Here we use k = α² / 2 for SG lights (closer to analytic).
+    `alpha` here is α = roughness² (the GGX width). We use the IBL / environment-
+    lighting remap k = α / 2 = roughness²/2 (Karis 2013), since our lighting is the
+    per-pixel environment (NOT an analytic punctual light, whose remap would be
+    k = (roughness+1)²/8). Previously this computed k = α²/2 = roughness⁴/2, which
+    over-squared α and gave too-weak geometric shadowing (specular too bright).
 
     Args:
         ndotl: [B, S, H, W] clamped to [0, 1]
@@ -262,7 +265,7 @@ def smith_geometry(ndotl: torch.Tensor, ndotv: torch.Tensor, alpha: torch.Tensor
     Returns:
         G: [B, S, H, W]
     """
-    k = alpha * alpha / 2.0
+    k = alpha / 2.0                                    # IBL: k = α/2 = roughness²/2
     g1_v = ndotv / (ndotv * (1.0 - k) + k + 1e-8)
     g1_l = ndotl / (ndotl * (1.0 - k) + k + 1e-8)
     return g1_v * g1_l

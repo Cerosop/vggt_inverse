@@ -8,6 +8,17 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# DataLoader tensor sharing: the per-pixel env GT (gt_env_pixel, 120x160x8x16x3 =
+# ~28MB/frame) makes each collated batch huge; the default 'file_descriptor' strategy
+# pushes these through /dev/shm and exhausts it (RuntimeError: unable to allocate shared
+# memory(shm)). 'file_system' backs shared tensors with regular files instead -> no
+# /dev/shm limit. Must be set in the main process BEFORE workers spawn.
+import torch.multiprocessing as _mp
+try:
+    _mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
+
 import argparse
 from hydra import initialize, compose
 from omegaconf import DictConfig, OmegaConf

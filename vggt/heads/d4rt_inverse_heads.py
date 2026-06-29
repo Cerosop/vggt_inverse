@@ -22,11 +22,13 @@ from vggt.heads.query_decoder import QueryEmbedder, IndependentQueryDecoder
 def _hemisphere_dirs(env_h: int, env_w: int) -> torch.Tensor:
     """Unit vectors for an (env_h x env_w) upper-hemisphere grid, pole = +y (local normal).
 
-    elevation theta in [0, pi/2] over rows; azimuth phi in [0, 2pi) over cols.
+    elevation El in [0, pi/2] over rows; azimuth Az in [-pi, pi) over cols, using
+    OpenRooms' convention Az=((j+0.5)/env_w-0.5)*2pi so the render reconstructs each
+    cell at the same azimuth zero the imenvlow GT was authored in.
     Returns [env_h*env_w, 3].
     """
-    theta = (torch.arange(env_h).float() + 0.5) / env_h * (math.pi / 2)   # [env_h]
-    phi = (torch.arange(env_w).float() + 0.5) / env_w * (2 * math.pi)     # [env_w]
+    theta = (torch.arange(env_h).float() + 0.5) / env_h * (math.pi / 2)   # El [env_h]
+    phi = (((torch.arange(env_w).float() + 0.5) / env_w) - 0.5) * (2 * math.pi)  # Az [-pi,pi)
     th, ph = torch.meshgrid(theta, phi, indexing="ij")                    # [env_h, env_w]
     x = torch.sin(th) * torch.cos(ph)
     y = torch.cos(th)                 # pole (+y) = normal
@@ -379,7 +381,7 @@ class D4RTInverseHeads(nn.Module):
 
     @torch.no_grad()
     def render_demo(self, tokens_list, images, patch_start_idx, material=None,
-                    point_map=None, camera_pos=None):
+                    point_map=None, camera_pos=None, cam_rot=None):
         """Smart full-res render: full-res material × lighting computed on a coarse
         (H/f, W/f) grid then upsampled by f = self.render_demo_upsample.
 
@@ -387,6 +389,9 @@ class D4RTInverseHeads(nn.Module):
         Specular (if point_map/camera_pos given) is evaluated on the coarse grid and
         upsampled (lighting is low-freq, so this is cheap and visually fine).
         `material`: optional precomputed full-res maps {name:[B,S,H,W,c]} (else queried).
+        `cam_rot`: optional [BS,3,3] world->cam rotation; if given the specular view dir
+        is rotated into the camera frame (OpenRooms convention). If None the specular
+        preview uses the world-frame view (approximate — preview only).
         Returns sRGB [B,S,H,W,3].
         """
         from vggt.heads.per_pixel_renderer import render_pixels
@@ -432,7 +437,9 @@ class D4RTInverseHeads(nn.Module):
             pos = F.grid_sample(pm, grid, mode="bilinear", align_corners=True,
                                 padding_mode="border").squeeze(-1).permute(0, 2, 1)
             cam = camera_pos.reshape(BS, 3)[:, None, :]
-            view = F.normalize(cam - pos, dim=-1, eps=1e-8)
+            view = F.normalize(cam - pos, dim=-1, eps=1e-8)        # [BS, Hl*Wl, 3] world
+            if cam_rot is not None:                                # rotate into camera frame
+                view = torch.einsum('bij,bpj->bpi', cam_rot.reshape(BS, 3, 3).to(view.dtype), view)
             Nc = BS * Hl * Wl
             _, spec = render_pixels(
                 alb_c.reshape(Nc, 3), nrm_c.reshape(Nc, 3), rgh_c.reshape(Nc, 1), met_c.reshape(Nc, 1),

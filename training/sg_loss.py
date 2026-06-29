@@ -647,9 +647,18 @@ def per_pixel_render_loss(
     view = None
     wp, pe = predictions.get("world_points"), predictions.get("pose_enc")
     if wp is not None and pe is not None:
-        pos = _samp(wp)                              # [B,S,P,3]
-        cam = pe[..., :3].unsqueeze(2)               # [B,S,1,3]
-        view = F.normalize(cam - pos, dim=-1, eps=1e-8)
+        pos = _samp(wp)                              # [B,S,P,3] world
+        cam = pe[..., :3].unsqueeze(2)               # [B,S,1,3] world
+        view_w = F.normalize(cam - pos, dim=-1, eps=1e-8)   # world, surface->camera
+        # OpenRooms per-pixel env / normals are in a y-UP camera frame (x-right, y-up,
+        # z-back). VGGT pose R = quat_to_mat is world->OpenCV-cam (y-down, z-forward),
+        # so compose with the OpenCV->y-up flip C = diag(1,-1,-1) (180° about x, proper
+        # rotation since both are right-handed): R_or = C @ R, world -> OpenRooms y-up cam.
+        from vggt.utils.rotation import quat_to_mat
+        R = quat_to_mat(pe[..., 3:7])                       # [B,S,3,3] world->OpenCV cam
+        C = R.new_tensor([[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]])
+        R_or = torch.einsum('ij,bsjk->bsik', C, R)          # world -> OpenRooms y-up cam
+        view = torch.einsum('bsij,bspj->bspi', R_or, view_w)  # [B,S,P,3] y-up cam frame
 
     N = B * S * P
     rendered = render_pixels(
