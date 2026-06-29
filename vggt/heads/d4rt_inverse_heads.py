@@ -407,7 +407,15 @@ class D4RTInverseHeads(nn.Module):
         d = self.dir_grid[None].expand(Hs * Ws, Dn, 3).reshape(-1, 3)
         u = u[None].expand(B * S, -1); v = v[None].expand(B * S, -1)
         d = d[None].expand(B * S, -1, -1)
-        rad = self._light_radiance(mem, u, v, d)                      # [BS, Hs*Ws*Dn, 3]
+        # Chunk over the (Hs*Ws*Dn) queries to bound the attention memory (no_grad eval,
+        # but the forward attention itself spikes if all queries run at once).
+        total = Hs * Ws * Dn
+        chunk = 16384
+        outs = []
+        for s0 in range(0, total, chunk):
+            e0 = min(s0 + chunk, total)
+            outs.append(self._light_radiance(mem, u[:, s0:e0], v[:, s0:e0], d[:, s0:e0]))
+        rad = torch.cat(outs, dim=1)                                  # [BS, Hs*Ws*Dn, 3]
         return rad.reshape(B, S, Hs, Ws, self.env_h, self.env_w, 3)
 
     def forward(self, tokens_list: List[torch.Tensor], images: torch.Tensor,
@@ -444,12 +452,9 @@ class D4RTInverseHeads(nn.Module):
                 preds["render_solid_angle"] = self.solid_angle  # [Dn]
                 for _k, _v in rmat.items():
                     preds[f"render_{_k}"] = _v                  # render_albedo/normal/...
-            # Eval: also emit a coarse dense env for visualization (cheap grid).
-            if not self.training:
-                gh = min(self.light_spatial_h, 16)
-                gw = min(self.light_spatial_w, 16)
-                preds["pred_env_pixel"] = self.predict_env_dense(
-                    tokens_list, patch_start_idx, gh, gw)   # [B,S,gh,gw,env_h,env_w,3]
+            # NOTE: pred_env_pixel (predict_env_dense) is NOT computed here — that would
+            # run for the WHOLE val batch every step (unchunked → big attention spike).
+            # The trainer demo calls predict_env_dense itself, only for the demo frame(s).
 
         # Expose the dynamic-weighting log-variance. Add a zero "ghost" onto one live
         # prediction so every task_log_var entry has a (zero) gradient — keeps DDP from

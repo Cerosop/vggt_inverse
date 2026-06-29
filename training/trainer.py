@@ -635,9 +635,16 @@ class Trainer:
                                 logging.warning(f"[val demo] gt_env_map save failed: {e}")
 
                     # --- d4rt per-pixel env demo (lighting_mode="per_pixel_env") ---
-                    # No SG to render; instead visualize the predicted env tile at the
-                    # center spatial pixel (8x16 hemisphere) vs the imenvlow GT tile.
-                    pe = y_hat.get("pred_env_pixel")
+                    # Visualize the predicted env tile at the center spatial pixel
+                    # (8x16 hemisphere) vs the imenvlow GT tile. Compute it HERE for just
+                    # the demo frame (chunked) — not in the eval forward over the whole batch.
+                    pe = None
+                    if _tk is not None and _d4rt.enable_lighting:
+                        try:
+                            with torch.no_grad():
+                                pe = _d4rt.predict_env_dense(_tk, _psi, 16, 16)  # [1,1,16,16,8,16,3]
+                        except Exception as e:
+                            logging.warning(f"[val demo] pred_env_pixel compute failed: {e}")
                     if isinstance(pe, torch.Tensor):
                         try:
                             def _env_tile_img(tile):  # [env_h, env_w, 3] HDR -> [3,Hh,Ww] LDR
@@ -648,7 +655,7 @@ class Trainer:
                                     t, scale_factor=16, mode="nearest")  # upscale for visibility
                                 return torch.clamp(t[0], 0., 1.)
                             gh, gw = pe.shape[2], pe.shape[3]
-                            ptile = pe[0, img_idx, gh // 2, gw // 2]   # [env_h,env_w,3]
+                            ptile = pe[0, 0, gh // 2, gw // 2]         # demo frame (S=1) -> [0,0]
                             save_image(_env_tile_img(ptile),
                                        os.path.join(out_dir, "pred_env_pixel.png"))
                             gep = batch.get("gt_env_pixel")
