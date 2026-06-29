@@ -143,12 +143,15 @@ class D4RTInverseHeads(nn.Module):
         mem = self.mem_proj(patch)                # [B,S,Npatch,D]
         D = mem.shape[-1]
         if self.cross_frame:
-            # tag each token with its frame id, then make EVERY query (of a scene) attend
-            # to ALL frames of that scene: mem -> [B*S, S*Npatch, D] (replicated per frame).
+            # tag each token with its frame id, then keep ONE memory per scene
+            # ([B, S*Npatch, D]) — NOT replicated per frame. Each query attends to all S
+            # frames' tokens by folding the per-frame query sets into the batch=B dim in
+            # _decode (d4rt-style: one shared video memory, frame id carried by the query).
+            # This avoids materialising / re-projecting the K/V S times (the old
+            # [B*S, S*Npatch, D] replication that cost ~S× memory and K/V compute).
             fe = self.frame_embed(torch.arange(S, device=mem.device))   # [S, D]
             mem = mem + fe[None, :, None, :]
-            mem = mem.reshape(B, S * Npatch, D)
-            mem = mem[:, None].expand(B, S, S * Npatch, D).reshape(B * S, S * Npatch, D)
+            mem = mem.reshape(B, S * Npatch, D)   # [B, S*Npatch, D]
         else:
             mem = mem.reshape(B * S, Npatch, D)   # [B*S, Npatch, D]
         return mem, B, S, Npatch
@@ -161,6 +164,28 @@ class D4RTInverseHeads(nn.Module):
         S = max(1, mem.shape[1] // self._npatch)
         fid = torch.arange(BS, device=q.device) % S    # frame id of each batch element
         return q + self.frame_embed(fid)[:, None, :]
+
+    def _decode(self, decoder, q, mem, ckpt=False):
+        """Run a cross-attn decoder, sharing ONE per-scene memory across that scene's frames.
+
+        cross_frame: `mem` is [B, S*Npatch, D] (a single copy per scene). The per-frame
+        query set q [B*S, M, D] is folded to [B, S*M, D] so all S frames' queries attend
+        to that single memory in one batch — avoiding the old [B*S, S*Npatch, D]
+        replication (which re-stored & re-projected the identical K/V S times). Frame
+        identity is already baked into q by _add_query_frame_embed, so the fold is exact.
+        Non-cross_frame: mem is [B*S, Npatch, D] and matches q's batch → no fold.
+        The attention scores (queries × memory tokens) are identical either way; what this
+        saves is the S× K/V memory + K/V projection compute.
+        """
+        BS, M, D = q.shape
+        Bm = mem.shape[0]
+        fold = Bm != BS
+        if fold:
+            q = q.reshape(Bm, (BS // Bm) * M, D)        # [B, S*M, D]
+        out = checkpoint(decoder, q, mem, use_reentrant=False) if ckpt else decoder(q, mem)
+        if fold:
+            out = out.reshape(BS, M, D)
+        return out
 
     @staticmethod
     def _apply_material_activation(name, x):
@@ -177,10 +202,8 @@ class D4RTInverseHeads(nn.Module):
         """
         q = self.mat_query(u, v, image=images_bs)                # [BS,M,D]
         q = self._add_query_frame_embed(q, mem)
-        if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-            dec = checkpoint(self.mat_decoder, q, mem, use_reentrant=False)
-        else:
-            dec = self.mat_decoder(q, mem)
+        ckpt = self.grad_checkpoint and self.training and torch.is_grad_enabled()
+        dec = self._decode(self.mat_decoder, q, mem, ckpt=ckpt)  # [BS,M,D]
         z = self.mat_trunk(dec)                                  # [BS,M,D]
         return {name: self.mat_heads[name](z) for name in self.head_names}
 
@@ -224,17 +247,16 @@ class D4RTInverseHeads(nn.Module):
                 for name, r in raw.items()}
 
     def _light_radiance(self, mem, u, v, direction, ckpt=False):
-        """mem:[B*S,N,D]; u,v:[B*S,M]; direction:[B*S,M,3] -> radiance [B*S,M,3] (softplus).
+        """mem:[B,S*Npatch,D] (cross_frame) or [B*S,Npatch,D]; u,v:[B*S,M]; direction:[B*S,M,3]
+        -> radiance [B*S,M,3] (softplus).
 
         ckpt: gradient-checkpoint the light decoder (env-loss path). The render path
         (_light_env_tiles) already wraps this whole fn in checkpoint, so it passes ckpt=False.
         """
         q = self.light_query(u, v, direction=direction)
         q = self._add_query_frame_embed(q, mem)
-        if ckpt and self.training and torch.is_grad_enabled():
-            z = checkpoint(self.light_decoder, q, mem, use_reentrant=False)
-        else:
-            z = self.light_decoder(q, mem)
+        z = self._decode(self.light_decoder, q, mem,
+                         ckpt=(ckpt and self.training and torch.is_grad_enabled()))
         return F.softplus(self.light_head(z))
 
     def _light_branch_sampled(self, mem, B, S):
