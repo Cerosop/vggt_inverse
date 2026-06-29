@@ -73,6 +73,11 @@ class D4RTInverseHeads(nn.Module):
         self.render_demo_upsample = render_demo_upsample
         self.cross_frame = cross_frame
         self.grad_checkpoint = grad_checkpoint
+        self.decoder_dim = decoder_dim
+        # Fraction of *currently free* VRAM an eval/demo dense pass may target when
+        # auto-sizing its query chunk (see _auto_chunk). Val has no backward graph, so we
+        # can use the headroom that training can't. Tune up for faster val, down if it OOMs.
+        self.val_chunk_target = 0.35
         self._npatch = None               # set in _build_memory (for frame-id recovery)
         self.head_names = ["albedo", "metallic", "roughness", "normal", "shading"]
 
@@ -249,6 +254,33 @@ class D4RTInverseHeads(nn.Module):
                 spatial_idx.reshape(B, S, M),
                 dir_idx.reshape(B, S, M))
 
+    def _auto_chunk(self, mem, base=16384, hard_cap=1 << 19):
+        """Pick a per-pass query count for eval/demo dense passes from FREE VRAM.
+
+        These passes (predict_material_dense / predict_env_dense / render_demo env tiles)
+        run under no_grad, so no backward graph is stored and the only live memory per
+        query is the forward working set. The more free VRAM, the bigger the chunk we can
+        run in one cross-attn pass → fewer sequential passes → faster val. We size the
+        chunk to `val_chunk_target` of the reusable headroom (driver-free + allocator
+        cache that can be recycled), clamped to [base, hard_cap]. During training (grad
+        enabled) we never grow past `base` — train has no headroom to spare.
+        """
+        import os
+        if (self.training and torch.is_grad_enabled()) or not torch.cuda.is_available() \
+                or os.environ.get("VGGT_DISABLE_AUTOCHUNK"):
+            return base
+        try:
+            free, _ = torch.cuda.mem_get_info(mem.device)
+            free += torch.cuda.memory_reserved(mem.device) - torch.cuda.memory_allocated(mem.device)
+        except Exception:
+            return base
+        bs = mem.shape[0]
+        # no_grad per-query cost ≈ bs * decoder_dim * 2 (bf16) * ~16 (q + attn + mlp
+        # hidden + head intermediates, one decoder layer live at a time + SDPA temp + 2x safety)
+        per_q = max(1, bs * self.decoder_dim * 2 * 16)
+        chunk = int(free * self.val_chunk_target / per_q)
+        return max(base, min(chunk, hard_cap))
+
     def _light_env_tiles(self, mem, u, v, chunk=2048):
         """Full env (all Dn dirs) at P pixels. u,v:[BS,P] -> [BS,P,Dn,3].
 
@@ -293,7 +325,7 @@ class D4RTInverseHeads(nn.Module):
         return env.reshape(B, S, P, -1, 3), uv.reshape(B, S, P, 2), mat
 
     @torch.no_grad()
-    def predict_material_dense(self, tokens_list, images, patch_start_idx, chunk=16384):
+    def predict_material_dense(self, tokens_list, images, patch_start_idx, chunk=None):
         """Full per-pixel material maps for demo / inference -> dict name->[B,S,H,W,c].
 
         Queries EVERY pixel (chunked) so the maps show the true per-pixel detail the
@@ -301,6 +333,8 @@ class D4RTInverseHeads(nn.Module):
         """
         B, S, _, H, W = images.shape
         mem, _, _, _ = self._build_memory(tokens_list, patch_start_idx)
+        if chunk is None:
+            chunk = self._auto_chunk(mem)
         images_bs = images.reshape(B * S, 3, H, W)
         dev = mem.device
         us = (torch.arange(W, device=dev).float() + 0.5) / W
@@ -355,7 +389,7 @@ class D4RTInverseHeads(nn.Module):
         vv, uu = torch.meshgrid(sh, sw, indexing="ij")
         u = uu.reshape(1, -1).expand(BS, -1)           # [BS, Hl*Wl]
         v = vv.reshape(1, -1).expand(BS, -1)
-        env = self._light_env_tiles(mem, u, v, chunk=16384)   # [BS, Hl*Wl, Dn, 3]
+        env = self._light_env_tiles(mem, u, v, chunk=self._auto_chunk(mem))   # [BS, Hl*Wl, Dn, 3]
         Dn = env.shape[2]
 
         # diffuse irradiance (material-free) -> upsample to full res
@@ -410,7 +444,7 @@ class D4RTInverseHeads(nn.Module):
         # Chunk over the (Hs*Ws*Dn) queries to bound the attention memory (no_grad eval,
         # but the forward attention itself spikes if all queries run at once).
         total = Hs * Ws * Dn
-        chunk = 16384
+        chunk = self._auto_chunk(mem)
         outs = []
         for s0 in range(0, total, chunk):
             e0 = min(s0 + chunk, total)
