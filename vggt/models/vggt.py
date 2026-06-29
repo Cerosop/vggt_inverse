@@ -18,6 +18,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
                  enable_inverse=False, enable_lora=False, lora_rank=16, lora_alpha=32,
+                 lora_alpha_mult=2.0,
                  lora_tail_layers=0, lora_tail_rank=64,
                  lora_global_base_rank=None,
                  inverse_frames_chunk_size=8, skip_vggt_heads_in_train=False,
@@ -53,6 +54,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.aggregator = Aggregator(
             img_size=img_size, patch_size=patch_size, embed_dim=embed_dim,
             enable_lora=enable_lora, lora_rank=lora_rank, lora_alpha=lora_alpha,
+            lora_alpha_mult=lora_alpha_mult,
             lora_tail_layers=lora_tail_layers, lora_tail_rank=lora_tail_rank,
             lora_global_base_rank=lora_global_base_rank,
             enable_light_token=enable_light_token,

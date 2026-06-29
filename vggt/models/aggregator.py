@@ -72,7 +72,8 @@ class Aggregator(nn.Module):
         init_values=0.01,
         enable_lora=False,
         lora_rank=16,
-        lora_alpha=32,
+        lora_alpha=32,            # legacy fixed alpha (unused; scaling now = lora_alpha_mult)
+        lora_alpha_mult=2.0,      # LoRA scaling = alpha/rank, kept CONSTANT by alpha = mult*rank
         lora_tail_layers=0,
         lora_tail_rank=64,
         lora_global_base_rank=None,
@@ -170,27 +171,24 @@ class Aggregator(nn.Module):
         self.enable_lora = enable_lora
         if enable_lora:
             from vggt.layers.lora import LoRABlock
+
+            def _mk_lora_block(blk, i, base_rank):
+                # Tail layers (closest to the output) use the higher rank. alpha tracks
+                # rank (alpha = lora_alpha_mult * rank) so the LoRA scaling (alpha/rank =
+                # lora_alpha_mult) is the SAME for every layer — a fixed alpha would shrink
+                # the high-rank tail's effective update (e.g. 32/64=0.5 vs 32/16=2.0).
+                r = lora_tail_rank if (lora_tail_layers > 0 and i >= depth - lora_tail_layers) else base_rank
+                return LoRABlock(blk, rank=r, alpha=lora_alpha_mult * r)
+
             if self.lora_skip_frame:
                 # Frame blocks stay frozen (no adapter); the LoRA frame step routes
                 # through the original frozen frame_blocks in the forward pass.
                 self.lora_frame_blocks = None
             else:
-                self.lora_frame_blocks = nn.ModuleList([
-                    LoRABlock(
-                        blk,
-                        rank=lora_tail_rank if (lora_tail_layers > 0 and i >= depth - lora_tail_layers) else lora_rank,
-                        alpha=lora_alpha,
-                    )
-                    for i, blk in enumerate(self.frame_blocks)
-                ])
-            self.lora_global_blocks = nn.ModuleList([
-                LoRABlock(
-                    blk,
-                    rank=lora_tail_rank if (lora_tail_layers > 0 and i >= depth - lora_tail_layers) else _global_base_rank,
-                    alpha=lora_alpha,
-                )
-                for i, blk in enumerate(self.global_blocks)
-            ])
+                self.lora_frame_blocks = nn.ModuleList(
+                    [_mk_lora_block(blk, i, lora_rank) for i, blk in enumerate(self.frame_blocks)])
+            self.lora_global_blocks = nn.ModuleList(
+                [_mk_lora_block(blk, i, _global_base_rank) for i, blk in enumerate(self.global_blocks)])
         else:
             self.lora_frame_blocks = None
             self.lora_global_blocks = None
