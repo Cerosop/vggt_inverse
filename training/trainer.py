@@ -412,7 +412,7 @@ class Trainer:
         if self.mode == "train":
             self.run_train()
             # Optionally run a final validation after all training is done
-            self.run_val()
+            self._run_val_safe()
         elif self.mode == "val":
             self.run_val()
         else:
@@ -438,11 +438,90 @@ class Trainer:
             # Run validation at the specified frequency
             # Skips validation after the last training epoch, as it can be run separately.
             if self.epoch % self.val_epoch_freq == 0 and self.epoch < self.max_epochs - 1:
-                self.run_val()
+                self._run_val_safe()
             
             self.epoch += 1
         
         self.epoch -= 1
+
+    def _run_val_safe(self):
+        """Run validation without ever letting a val failure kill training.
+
+        Validation is NOT on the critical path for training progress, yet it
+        exercises a much heavier per-batch payload than training (all GT maps plus
+        gt_env_pixel/gt_env_map/gt_sg for the demo + ceiling renders). A DataLoader
+        worker error there — e.g. the '/dev/shm' shared-memory exhaustion we hit
+        around val batch ~99 — would otherwise abort the whole (multi-day) run.
+        Catch it, reset CUDA/GC state, and carry on with the next training epoch.
+        The standalone `mode == "val"` path still calls run_val() directly so a
+        pure validation job surfaces errors instead of swallowing them.
+        """
+        try:
+            self.run_val()
+        except Exception as e:
+            logging.error(
+                f"Validation at epoch {self.epoch} failed and was SKIPPED so "
+                f"training can continue: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            # A crashed DataLoader worker can leave CUDA / allocator state dirty
+            # AND leak /dev/shm files. Under the 'file_system' sharing strategy the
+            # shm files from dead workers are NOT reclaimed by gc/empty_cache, so
+            # /dev/shm stays full and the NEXT dataloader — even the next TRAIN
+            # epoch's — fails too (that path is not wrapped, so it would kill the
+            # run). Reset CUDA state and reclaim the leaked shm so training can
+            # actually proceed on a clean slate.
+            try:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                freed = self._reclaim_dead_shm()
+                if freed:
+                    logging.warning(
+                        f"Reclaimed {freed} leaked /dev/shm torch_* file(s) from "
+                        f"dead workers so the next epoch has shared memory again."
+                    )
+            except Exception:
+                logging.warning("post-val-failure cleanup hit an error", exc_info=True)
+            # Leave the model ready for training regardless of where val died.
+            self.model.train()
+
+    @staticmethod
+    def _reclaim_dead_shm():
+        """Delete this user's /dev/shm 'torch_*' files whose creator PID is dead.
+
+        The 'file_system' tensor-sharing strategy (set in launch.py) backs shared
+        tensors with files named 'torch_<pid>_<rand>_<n>' in /dev/shm. When a
+        DataLoader worker dies abnormally (e.g. shared-memory exhaustion) those
+        files are orphaned and never cleaned up, keeping /dev/shm full. We remove
+        only files that (a) this uid owns and (b) whose embedded creator PID no
+        longer exists — so we never touch shared memory still in use by a live
+        process, whether ours or a co-tenant's on this shared machine.
+        """
+        import glob
+        try:
+            uid = os.getuid()
+        except AttributeError:
+            return 0  # non-POSIX; nothing to do
+        removed = 0
+        for path in glob.glob("/dev/shm/torch_*"):
+            try:
+                if os.stat(path).st_uid != uid:
+                    continue
+            except OSError:
+                continue
+            parts = os.path.basename(path).split("_")
+            if len(parts) < 2 or not parts[1].isdigit():
+                continue
+            if os.path.exists(f"/proc/{parts[1]}"):
+                continue  # creator process still alive -> in use, leave it
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+        return removed
 
     def run_val(self):
         """Runs a full validation epoch if a validation dataset is available."""
@@ -451,12 +530,18 @@ class Trainer:
             return
 
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
-        self.val_epoch(dataloader)
-        
-        del dataloader
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        try:
+            self.val_epoch(dataloader)
+        finally:
+            # Always tear the loader down, even if val_epoch raised (e.g. a
+            # DataLoader worker died on shared-memory exhaustion). Dropping the
+            # last reference + gc lets PyTorch shut the workers down and its
+            # shm-manager unlink the /dev/shm files, so the next val/train starts
+            # from a clean slate instead of inheriting leaked shared memory.
+            del dataloader
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
 
     @torch.no_grad()

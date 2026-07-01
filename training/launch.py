@@ -8,15 +8,18 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# DataLoader tensor sharing: the per-pixel env GT (gt_env_pixel, 120x160x8x16x3 =
-# ~28MB/frame) makes each collated batch huge; the default 'file_descriptor' strategy
-# pushes these through /dev/shm and exhausts it (RuntimeError: unable to allocate shared
-# memory(shm)). 'file_system' backs shared tensors with regular files instead -> no
-# /dev/shm limit. Must be set in the main process BEFORE workers spawn.
+# DataLoader tensor sharing strategy.
+# NOTE (2026-07): the old 'file_system' override below caused the SAME
+# "unable to allocate shared memory(shm): Success (0)" failures (32 val workers
+# hammering POSIX shm). /dev/shm space, inodes and RAM were all <2% used, so it
+# was never an exhaustion problem. This env's RLIMIT_NOFILE is 1,048,576, so the
+# original "too many open files" reason for switching to file_system no longer
+# holds. Testing the DEFAULT 'file_descriptor' strategy instead (override disabled).
 import torch.multiprocessing as _mp
+_SHARING_STRATEGY = os.environ.get("VGGT_SHARING_STRATEGY", "file_descriptor")
 try:
-    _mp.set_sharing_strategy("file_system")
-except RuntimeError:
+    _mp.set_sharing_strategy(_SHARING_STRATEGY)
+except (RuntimeError, ValueError):
     pass
 
 import argparse
